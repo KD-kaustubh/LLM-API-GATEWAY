@@ -1,7 +1,20 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from gateway.errors import ProviderError, TransientProviderError
+
 Role = Literal["system", "user", "assistant"]
+
+# Upstream statuses that signal a temporary condition. Other 5xx (e.g. 500) may be
+# deterministic for a given request, so they are not retried.
+TRANSIENT_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
+
+
+def error_for_status(provider_label: str, status_code: int | None) -> ProviderError:
+    message = f"{provider_label} request failed with status {status_code}"
+    if status_code in TRANSIENT_STATUS_CODES:
+        return TransientProviderError(message)
+    return ProviderError(message)
 
 
 @dataclass(frozen=True)

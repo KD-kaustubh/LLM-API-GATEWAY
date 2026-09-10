@@ -34,6 +34,12 @@ def test_configured_model_name_is_used() -> None:
     assert get_provider("gemini", _configured())._model == "gemini-model"
 
 
+@pytest.mark.parametrize("model", ["groq", "gemini"])
+def test_configured_timeout_is_passed_to_provider(model: str) -> None:
+    settings = _configured().model_copy(update={"provider_timeout_seconds": 7.5})
+    assert get_provider(model, settings)._timeout_seconds == 7.5
+
+
 @pytest.mark.parametrize(("model", "env_var"), [("groq", "GROQ_API_KEY"), ("gemini", "GOOGLE_API_KEY")])
 def test_missing_credentials_raise(settings: Settings, model: str, env_var: str) -> None:
     with pytest.raises(ProviderNotConfiguredError, match=env_var):

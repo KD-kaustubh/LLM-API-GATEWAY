@@ -11,7 +11,7 @@ capabilities are introduced incrementally, phase by phase.
 
 ## Current Status
 
-Phase 2 — Authentication + Validation
+Phase 3 — Reliability + Rate Limiting
 
 Implemented:
 
@@ -21,9 +21,10 @@ Implemented:
 - API-key authentication for all `/v1` endpoints (`/health` stays public)
 - Hashed credential storage (in-memory for now), key generation, and revocation
 - Request body size limit and consistent, machine-readable error responses
+- Provider timeouts and bounded retries with backoff for transient provider failures
+- Per-client rate limiting (`429` with `Retry-After`)
 
-Rate limiting, quotas, retries/fallback, caching, persistence, and observability are
-**not** implemented yet.
+Provider fallback, quotas, caching, persistence, and observability are **not** implemented yet.
 
 ## Architecture
 
@@ -31,16 +32,19 @@ Rate limiting, quotas, retries/fallback, caching, persistence, and observability
 Client
  ↓
 FastAPI
- ├── Body size limit (middleware)
- ├── API-key authentication (dependency)  → 401
- └── Pydantic request validation          → 422
+ ├── Body size limit (middleware)          → 413
+ ├── API-key authentication (dependency)   → 401
+ ├── Rate limit per client (dependency)    → 429
+ └── Pydantic request validation           → 422
  ↓
 Inference Service
- ↓
-Provider Factory
- ├── Mock
- ├── Groq
- └── Gemini
+ ├── Provider Factory (once per request)   → 400 / 503
+ └── Retrier (transient errors only)       → 502 when exhausted
+      ↓
+     Provider (with per-attempt timeout)
+      ├── Mock
+      ├── Groq
+      └── Gemini
 ```
 
 - **API layer** (`gateway/api`) validates requests and delegates to the inference service.
@@ -48,9 +52,11 @@ Provider Factory
 - **Authentication** (`gateway/auth`) generates, hashes, stores, and verifies API keys. It
   knows nothing about providers or inference; `gateway/api/security.py` adapts it to FastAPI.
 - **Inference service** (`gateway/services/inference.py`) resolves a provider, converts the
-  API request into an internal `ProviderRequest`, calls the provider, and builds the
-  `ChatCompletionResponse` (including a `req_<uuid>` request ID). It does not know how API
-  keys are stored.
+  API request into an internal `ProviderRequest`, calls the provider through the `Retrier`
+  (`gateway/services/retry.py`), and builds the `ChatCompletionResponse` (including a
+  `req_<uuid>` request ID). It does not know how API keys are stored.
+- **Rate limiter** (`gateway/rate_limit.py`) implements the `RateLimiter` protocol; the
+  `enforce_rate_limit` dependency applies it to every `/v1` route after authentication.
 - **Providers** (`gateway/providers`) implement the `LLMProvider` protocol:
   `generate(ProviderRequest) -> ProviderResponse`. Each SDK is imported only in its own
   module (`groq.py`, `gemini.py`).
@@ -143,6 +149,73 @@ Changing `API_KEY_PEPPER` invalidates every existing key hash.
   runtime disappear on restart. Persistent storage is planned for Phase 4; the `ApiKeyStore`
   protocol lets a database-backed store replace `InMemoryApiKeyStore` without changing routes.
 
+## Reliability
+
+### Timeouts
+
+Every provider attempt has a timeout of `PROVIDER_TIMEOUT_SECONDS` (default 30s), set through
+each SDK's own timeout option (Groq: `timeout` in seconds; Gemini: `HttpOptions.timeout` in
+milliseconds). Both SDKs' built-in retries are disabled so the gateway is the only retry layer
+and the total number of upstream calls stays bounded.
+
+### Retry policy
+
+Retrying a chat completion can duplicate work and cost money, so only failures explicitly
+classified as **transient** are retried. Everything else fails on the first attempt.
+
+| Retried (`TransientProviderError`)                  | Not retried                                            |
+|-----------------------------------------------------|--------------------------------------------------------|
+| Provider timeout (`ProviderTimeoutError`)           | Validation errors (`422`) and authentication (`401`)   |
+| Connection / network failures                       | Unsupported model (`400`), missing credentials (`503`) |
+| Upstream status `408`, `429`, `502`, `503`, `504`   | Other upstream statuses, including `400`–`404` and `500` |
+|                                                     | Empty provider responses, unexpected exceptions        |
+
+Upstream `500` is not retried because it can be deterministic for a given request; only
+statuses that signal a temporary condition are.
+
+- Attempts are bounded: at most `MAX_RETRIES + 1` provider calls per request (default 3).
+- Backoff is exponential with "equal jitter": before retry *n* the gateway waits between
+  50% and 100% of `min(RETRY_MAX_DELAY, RETRY_BASE_DELAY × 2^(n-1))` (defaults: 0.5s, 4s).
+- Provider resolution (unknown model, missing key) happens once, outside the retry loop.
+- When every attempt fails, the client receives the normal `502 provider_error` with a
+  gateway-generated message (for example `Groq request timed out`); SDK exception text is
+  never returned or logged.
+- Worst-case latency is roughly `(MAX_RETRIES + 1) × PROVIDER_TIMEOUT_SECONDS` plus backoff.
+  The request's worker thread is held while it waits. Fallback to a *different* provider is
+  not implemented.
+
+## Rate Limiting
+
+Every `/v1` request is rate limited **after** authentication, per authenticated `client_id`.
+All keys belonging to one client share its limit; the raw API key is never used as an
+identifier, stored, or logged. `/health` is never rate limited, and requests that fail
+authentication never touch any client's limit.
+
+- **Algorithm:** token bucket. Each client can burst up to `RATE_LIMIT_REQUESTS`, refilling
+  continuously at `RATE_LIMIT_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` (default 60/60s). A
+  client idle for a full window is back to its full allowance.
+- **Order:** the limit is checked before body validation, so invalid requests also count.
+- **Headers:** successful `/v1` responses include `X-RateLimit-Limit` and
+  `X-RateLimit-Remaining` for the calling client only.
+- **When exceeded:**
+
+  ```
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: 20
+  X-RateLimit-Limit: 3
+  X-RateLimit-Remaining: 0
+
+  {"error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}}
+  ```
+
+  `Retry-After` is the whole number of seconds until the client's next request is allowed.
+
+- **Limitations:** state is in memory and per process. Limits reset on restart, and running
+  several workers or instances multiplies the effective limit. The `RateLimiter` protocol
+  lets a shared backend (for example Redis) replace `InMemoryRateLimiter` in a later phase
+  without changing routes. Memory stays bounded: only authenticated clients get a bucket,
+  and buckets idle for a full window are pruned.
+
 ## API
 
 ### `POST /v1/chat/completions`
@@ -228,7 +301,8 @@ All errors share one shape:
 | 404    | `not_found`               | Unknown route                                          |
 | 413    | `request_too_large`       | Request body exceeds 1 MiB                             |
 | 422    | `invalid_request`         | Validation failed (includes a bounded `details` list)  |
-| 502    | `provider_error`          | The upstream provider call failed or returned no text  |
+| 429    | `rate_limit_error`        | Client exceeded its rate limit (see `Retry-After`)     |
+| 502    | `provider_error`          | Provider failed, timed out, or returned no text (after any retries) |
 | 503    | `provider_not_configured` | The selected provider's API key is not set             |
 | 500    | `internal_error`          | Unexpected error (no internal details are exposed)     |
 
@@ -306,6 +380,15 @@ Settings are read from environment variables, and optionally from a local `.env`
 | `GEMINI_MODEL_NAME` | `gemini-2.5-flash`        | Gemini model used for `model: "gemini"`         |
 | `API_KEY_PEPPER`    | *(unset)*                 | Secret HMAC key for hashing gateway API keys    |
 | `API_KEY_HASHES`    | *(unset)*                 | `client_id:key_id:key_hash` entries, comma-separated |
+| `PROVIDER_TIMEOUT_SECONDS` | `30`               | Per-attempt provider timeout (`0` < value ≤ `300`) |
+| `MAX_RETRIES`       | `2`                       | Retries after the first attempt (`0`–`5`)       |
+| `RETRY_BASE_DELAY`  | `0.5`                     | Backoff base in seconds (`0`–`30`)              |
+| `RETRY_MAX_DELAY`   | `4`                       | Backoff cap in seconds (≥ base, ≤ `60`)         |
+| `RATE_LIMIT_REQUESTS` | `60`                    | Requests allowed per window, per client (`1`–`100000`) |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60`              | Window / full-refill period in seconds          |
+
+Out-of-range or non-numeric values stop the application at startup with a validation error
+naming the setting.
 
 Provider keys are optional. The application starts and `/health` works without any keys.
 Requesting `groq` or `gemini` without its key returns a `503` `provider_not_configured`
@@ -328,6 +411,11 @@ The automated tests **never call external providers** and need no configuration:
   timing-safe verification, the store lifecycle (create/validate/revoke), every `401` path,
   that raw keys never appear in responses, error messages, stored records, or logs, bounded
   and non-echoing validation errors, and the body size limit.
+- Reliability tests count provider attempts for every retry scenario (success, transient
+  then success, exhaustion, timeouts, and each non-retryable error) using a fake `sleep`, so
+  no test waits for real backoff.
+- Rate-limit tests use an injected fake clock to advance time deterministically, and include
+  a 100-thread concurrency test proving the limit cannot be exceeded by racing requests.
 - The Groq and Gemini SDK clients are replaced with in-process fakes that return real SDK
   response objects, and an autouse fixture blocks any non-loopback network connection, so a
   test that accidentally reached the network would fail.
@@ -368,10 +456,11 @@ LLM-API-GATEWAY/
 │       ├── errors.py              # Client-safe error types and error envelope
 │       ├── main.py                # App creation and error handlers
 │       ├── middleware.py          # Request body size limit
+│       ├── rate_limit.py          # RateLimiter protocol and in-memory token bucket
 │       ├── api/
 │       │   ├── routes.py          # /health (public) and /v1/chat/completions (protected)
 │       │   ├── schemas.py         # Request/response models and validation limits
-│       │   └── security.py        # FastAPI Bearer authentication dependency
+│       │   └── security.py        # Authentication and rate-limit dependencies
 │       ├── auth/
 │       │   ├── keys.py            # API key generation and parsing
 │       │   ├── hashing.py         # HMAC-SHA256 hashing and timing-safe verification
@@ -381,7 +470,8 @@ LLM-API-GATEWAY/
 │       │   ├── bootstrap.py       # Build the credential store from settings
 │       │   └── cli.py             # gateway-create-key development helper
 │       ├── services/
-│       │   └── inference.py       # Provider-independent inference flow
+│       │   ├── inference.py       # Provider-independent inference flow
+│       │   └── retry.py           # RetryPolicy (backoff) and Retrier
 │       └── providers/
 │           ├── base.py            # LLMProvider protocol and internal types
 │           ├── factory.py         # model -> provider resolution
@@ -398,16 +488,10 @@ LLM-API-GATEWAY/
 
 ## Roadmap
 
-- [x] Phase 0 — Repository and API foundation
-- [x] Phase 1 — Core inference API + provider abstraction
-- [x] Phase 2 — Authentication + validation
-
-Planned (not implemented):
-
-- [ ] Persistence (Phase 4), including a database-backed credential store
-- [ ] Reliability and provider fallback
-- [ ] Rate limiting and quotas
-- [ ] Caching and usage tracking
-- [ ] Observability
-- [ ] Docker, testing and security hardening
-- [ ] Deployment and documentation
+- [x] Phase 0 — Foundation
+- [x] Phase 1 — Core API + Provider Abstraction
+- [x] Phase 2 — Authentication + Validation
+- [x] Phase 3 — Reliability + Rate Limiting
+- [ ] Phase 4 — Caching + Usage + Persistence
+- [ ] Phase 5 — Observability + Docker + Security
+- [ ] Phase 6 — Deployment + Documentation

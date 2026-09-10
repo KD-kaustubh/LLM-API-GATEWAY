@@ -22,12 +22,20 @@ def _build_mock(settings: Settings) -> LLMProvider:
 
 def _build_groq(settings: Settings) -> LLMProvider:
     api_key = _require_key(settings.groq_api_key, "GROQ_API_KEY", "groq")
-    return GroqProvider(api_key=api_key, model=settings.groq_model_name)
+    return GroqProvider(
+        api_key=api_key,
+        model=settings.groq_model_name,
+        timeout_seconds=settings.provider_timeout_seconds,
+    )
 
 
 def _build_gemini(settings: Settings) -> LLMProvider:
     api_key = _require_key(settings.google_api_key, "GOOGLE_API_KEY", "gemini")
-    return GeminiProvider(api_key=api_key, model=settings.gemini_model_name)
+    return GeminiProvider(
+        api_key=api_key,
+        model=settings.gemini_model_name,
+        timeout_seconds=settings.provider_timeout_seconds,
+    )
 
 
 PROVIDER_BUILDERS: dict[str, Callable[[Settings], LLMProvider]] = {

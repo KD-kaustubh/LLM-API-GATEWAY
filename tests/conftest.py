@@ -5,13 +5,14 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from gateway.api.security import get_api_key_service
+from gateway.api.security import get_api_key_service, get_rate_limiter
 from gateway.auth.hashing import ApiKeyHasher
 from gateway.auth.models import IssuedApiKey
 from gateway.auth.service import ApiKeyService
 from gateway.auth.store import InMemoryApiKeyStore
 from gateway.config import Settings, get_settings
 from gateway.main import app
+from gateway.rate_limit import InMemoryRateLimiter
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 _real_connect = socket.socket.connect
@@ -60,10 +61,36 @@ def auth_headers(issued_key: IssuedApiKey) -> dict[str, str]:
     return {"Authorization": f"Bearer {issued_key.api_key}"}
 
 
+class FakeClock:
+    """Manually advanced monotonic clock for deterministic time-based tests."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 @pytest.fixture
-def anon_client(settings: Settings, api_key_service: ApiKeyService) -> Iterator[TestClient]:
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def rate_limiter(clock: FakeClock) -> InMemoryRateLimiter:
+    return InMemoryRateLimiter(limit=1000, window_seconds=60, clock=clock)
+
+
+@pytest.fixture
+def anon_client(
+    settings: Settings, api_key_service: ApiKeyService, rate_limiter: InMemoryRateLimiter
+) -> Iterator[TestClient]:
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_api_key_service] = lambda: api_key_service
+    app.dependency_overrides[get_rate_limiter] = lambda: rate_limiter
     try:
         yield TestClient(app)
     finally:

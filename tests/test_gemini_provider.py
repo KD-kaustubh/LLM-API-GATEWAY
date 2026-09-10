@@ -5,7 +5,7 @@ import httpx
 import pytest
 from google.genai import errors, types
 
-from gateway.errors import ProviderError
+from gateway.errors import ProviderError, ProviderTimeoutError, TransientProviderError
 from gateway.providers import gemini as gemini_provider
 from gateway.providers.base import Message, ProviderRequest
 from gateway.providers.gemini import GeminiProvider, build_config, build_contents, parse_response
@@ -33,8 +33,11 @@ class FakeClient:
     calls: list[dict[str, Any]] = []
     result: Any = None
 
-    def __init__(self, api_key: str) -> None:
+    http_options: Any = None
+
+    def __init__(self, api_key: str, http_options: Any = None) -> None:
         self.api_key = api_key
+        FakeClient.http_options = http_options
         self.models = SimpleNamespace(generate_content=self._generate_content)
 
     def __enter__(self) -> "FakeClient":
@@ -113,8 +116,12 @@ def test_empty_response_raises_provider_error() -> None:
         parse_response(_response(text=None), fallback_model="configured")
 
 
+def _provider(model: str = "m") -> GeminiProvider:
+    return GeminiProvider(api_key=FAKE_KEY, model=model, timeout_seconds=12.5)
+
+
 def test_generate_calls_sdk_with_config(fake_client: type[FakeClient]) -> None:
-    result = GeminiProvider(api_key=FAKE_KEY, model="gemini-2.5-flash").generate(_request())
+    result = _provider("gemini-2.5-flash").generate(_request())
 
     assert result.content == "Hello from Gemini"
     [call] = fake_client.calls
@@ -124,21 +131,41 @@ def test_generate_calls_sdk_with_config(fake_client: type[FakeClient]) -> None:
     assert call["config"].system_instruction == "Be brief\n\nUse English"
 
 
+def test_client_uses_timeout_in_ms_and_disables_sdk_retries(fake_client: type[FakeClient]) -> None:
+    _provider().generate(_request())
+
+    options = fake_client.http_options
+    assert options.timeout == 12_500
+    assert options.retry_options.attempts == 1
+
+
+def _api_error(cls: type[errors.APIError], code: int) -> errors.APIError:
+    return cls(code, {"error": {"code": code, "message": f"detail with {FAKE_KEY}"}})
+
+
 @pytest.mark.parametrize(
-    ("error", "expected"),
+    ("error", "expected_type", "expected_message"),
     [
-        (errors.ClientError(429, {"error": {"code": 429, "message": "quota"}}), "Gemini request failed with status 429"),
-        (errors.ServerError(500, {"error": {"code": 500, "message": "boom"}}), "Gemini request failed with status 500"),
-        (httpx.ConnectError("connection refused"), "Gemini request failed"),
+        pytest.param(httpx.ReadTimeout("read timed out"), ProviderTimeoutError, "Gemini request timed out", id="read-timeout"),
+        pytest.param(httpx.ConnectTimeout("connect timed out"), ProviderTimeoutError, "Gemini request timed out", id="connect-timeout"),
+        pytest.param(httpx.ConnectError("connection refused"), TransientProviderError, "Gemini connection failed", id="connect-error"),
+        pytest.param(httpx.RemoteProtocolError("peer closed"), TransientProviderError, "Gemini connection failed", id="protocol-error"),
+        pytest.param(_api_error(errors.ClientError, 429), TransientProviderError, "Gemini request failed with status 429", id="status-429"),
+        pytest.param(_api_error(errors.ServerError, 503), TransientProviderError, "Gemini request failed with status 503", id="status-503"),
+        pytest.param(_api_error(errors.ServerError, 504), TransientProviderError, "Gemini request failed with status 504", id="status-504"),
+        pytest.param(_api_error(errors.ServerError, 500), ProviderError, "Gemini request failed with status 500", id="status-500"),
+        pytest.param(_api_error(errors.ClientError, 400), ProviderError, "Gemini request failed with status 400", id="status-400"),
+        pytest.param(_api_error(errors.ClientError, 403), ProviderError, "Gemini request failed with status 403", id="status-403"),
     ],
 )
-def test_sdk_errors_become_provider_errors(
-    fake_client: type[FakeClient], error: Exception, expected: str
+def test_sdk_errors_are_classified(
+    fake_client: type[FakeClient], error: Exception, expected_type: type, expected_message: str
 ) -> None:
     fake_client.result = error
 
     with pytest.raises(ProviderError) as exc_info:
-        GeminiProvider(api_key=FAKE_KEY, model="m").generate(_request())
+        _provider().generate(_request())
 
-    assert exc_info.value.message == expected
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.message == expected_message
     assert FAKE_KEY not in exc_info.value.message

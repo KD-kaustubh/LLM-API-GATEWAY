@@ -35,8 +35,31 @@ class ProviderNotConfiguredError(GatewayError):
 
 
 class ProviderError(GatewayError):
+    """Upstream provider failure. Not retried unless it is a TransientProviderError."""
+
     status_code = 502
     error_type = "provider_error"
+
+
+class TransientProviderError(ProviderError):
+    """Upstream failure that is likely to succeed if repeated (network, overload, timeout)."""
+
+
+class ProviderTimeoutError(TransientProviderError):
+    pass
+
+
+class RateLimitExceededError(GatewayError):
+    status_code = 429
+    error_type = "rate_limit_error"
+
+    def __init__(self, limit: int, retry_after_seconds: int) -> None:
+        super().__init__("Rate limit exceeded")
+        self.headers = {
+            "Retry-After": str(retry_after_seconds),
+            "X-RateLimit-Limit": str(limit),
+            "X-RateLimit-Remaining": "0",
+        }
 
 
 def error_response(

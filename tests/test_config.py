@@ -1,5 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from gateway.config import Settings
 
@@ -10,7 +11,73 @@ PROVIDER_ENV_VARS = (
     "GEMINI_MODEL_NAME",
     "API_KEY_PEPPER",
     "API_KEY_HASHES",
+    "PROVIDER_TIMEOUT_SECONDS",
+    "MAX_RETRIES",
+    "RETRY_BASE_DELAY",
+    "RETRY_MAX_DELAY",
+    "RATE_LIMIT_REQUESTS",
+    "RATE_LIMIT_WINDOW_SECONDS",
 )
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_reliability_and_rate_limit_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.provider_timeout_seconds == 30.0
+    assert settings.max_retries == 2
+    assert settings.retry_base_delay == 0.5
+    assert settings.retry_max_delay == 4.0
+    assert settings.rate_limit_requests == 60
+    assert settings.rate_limit_window_seconds == 60.0
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_reliability_and_rate_limit_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {
+        "PROVIDER_TIMEOUT_SECONDS": "12.5",
+        "MAX_RETRIES": "4",
+        "RETRY_BASE_DELAY": "0.25",
+        "RETRY_MAX_DELAY": "2",
+        "RATE_LIMIT_REQUESTS": "500",
+        "RATE_LIMIT_WINDOW_SECONDS": "30",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.provider_timeout_seconds == 12.5
+    assert settings.max_retries == 4
+    assert settings.retry_base_delay == 0.25
+    assert settings.retry_max_delay == 2.0
+    assert settings.rate_limit_requests == 500
+    assert settings.rate_limit_window_seconds == 30.0
+
+
+@pytest.mark.usefixtures("clean_env")
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MAX_RETRIES", "-1"),
+        ("MAX_RETRIES", "6"),
+        ("MAX_RETRIES", "two"),
+        ("RETRY_BASE_DELAY", "-0.1"),
+        ("RETRY_MAX_DELAY", "61"),
+        ("RETRY_MAX_DELAY", "0.1"),  # below the default base delay of 0.5
+        ("PROVIDER_TIMEOUT_SECONDS", "0"),
+        ("PROVIDER_TIMEOUT_SECONDS", "301"),
+        ("RATE_LIMIT_REQUESTS", "0"),
+        ("RATE_LIMIT_REQUESTS", "1.5"),
+        ("RATE_LIMIT_WINDOW_SECONDS", "0"),
+        ("RATE_LIMIT_WINDOW_SECONDS", "-10"),
+    ],
+)
+def test_invalid_reliability_settings_fail_clearly(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+    assert name.lower() in str(exc_info.value).lower() or "RETRY_MAX_DELAY" in str(exc_info.value)
 
 
 @pytest.fixture

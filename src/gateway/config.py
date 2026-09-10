@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,20 @@ class Settings(BaseSettings):
 
     api_key_pepper: SecretStr | None = None
     api_key_hashes: SecretStr | None = None
+
+    provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    max_retries: int = Field(default=2, ge=0, le=5)
+    retry_base_delay: float = Field(default=0.5, ge=0, le=30)
+    retry_max_delay: float = Field(default=4.0, ge=0, le=60)
+
+    rate_limit_requests: int = Field(default=60, ge=1, le=100_000)
+    rate_limit_window_seconds: float = Field(default=60.0, gt=0, le=86_400)
+
+    @model_validator(mode="after")
+    def _check_retry_delays(self) -> "Settings":
+        if self.retry_max_delay < self.retry_base_delay:
+            raise ValueError("RETRY_MAX_DELAY must be greater than or equal to RETRY_BASE_DELAY")
+        return self
 
 
 @lru_cache

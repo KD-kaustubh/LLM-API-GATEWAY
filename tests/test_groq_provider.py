@@ -6,7 +6,7 @@ import httpx
 import pytest
 from groq.types.chat import ChatCompletion
 
-from gateway.errors import ProviderError
+from gateway.errors import ProviderError, ProviderTimeoutError, TransientProviderError
 from gateway.providers import groq as groq_provider
 from gateway.providers.base import Message, ProviderRequest
 from gateway.providers.groq import GroqProvider, build_request_kwargs, parse_completion
@@ -35,8 +35,11 @@ class FakeGroq:
     calls: list[dict[str, Any]] = []
     result: Any = None
 
-    def __init__(self, api_key: str) -> None:
+    client_kwargs: dict[str, Any] = {}
+
+    def __init__(self, api_key: str, **kwargs: Any) -> None:
         self.api_key = api_key
+        FakeGroq.client_kwargs = kwargs
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def __enter__(self) -> "FakeGroq":
@@ -103,10 +106,12 @@ def test_empty_content_raises_provider_error() -> None:
         parse_completion(_completion(content=None), fallback_model="configured")
 
 
+def _provider(model: str = "m") -> GroqProvider:
+    return GroqProvider(api_key=FAKE_KEY, model=model, timeout_seconds=12.5)
+
+
 def test_generate_calls_sdk_with_config(fake_groq: type[FakeGroq]) -> None:
-    result = GroqProvider(api_key=FAKE_KEY, model="llama-3.3-70b-versatile").generate(
-        _request(max_tokens=20)
-    )
+    result = _provider("llama-3.3-70b-versatile").generate(_request(max_tokens=20))
 
     assert result.content == "Hello from Groq"
     [call] = fake_groq.calls
@@ -115,29 +120,54 @@ def test_generate_calls_sdk_with_config(fake_groq: type[FakeGroq]) -> None:
     assert call["max_completion_tokens"] == 20
 
 
-def _status_error() -> groq.APIStatusError:
-    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
-    return groq.RateLimitError("rate limited", response=httpx.Response(429, request=request), body=None)
+def test_client_uses_timeout_and_disables_sdk_retries(fake_groq: type[FakeGroq]) -> None:
+    _provider().generate(_request())
+    assert fake_groq.client_kwargs == {"timeout": 12.5, "max_retries": 0}
 
 
-def _connection_error() -> groq.APIConnectionError:
-    return groq.APIConnectionError(request=httpx.Request("POST", "https://api.groq.com"))
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def _status_error(status: int) -> groq.APIStatusError:
+    response = httpx.Response(status, request=httpx.Request("POST", _GROQ_URL))
+    return groq.APIStatusError(f"status {status} body with {FAKE_KEY}", response=response, body=None)
 
 
 @pytest.mark.parametrize(
-    ("error", "expected"),
+    ("error", "expected_type", "expected_message"),
     [
-        (_status_error(), "Groq request failed with status 429"),
-        (_connection_error(), "Groq request failed"),
+        pytest.param(
+            groq.APITimeoutError(request=httpx.Request("POST", _GROQ_URL)),
+            ProviderTimeoutError, "Groq request timed out", id="timeout",
+        ),
+        pytest.param(
+            groq.APIConnectionError(request=httpx.Request("POST", _GROQ_URL)),
+            TransientProviderError, "Groq connection failed", id="connection",
+        ),
+        *[
+            pytest.param(
+                _status_error(status), TransientProviderError,
+                f"Groq request failed with status {status}", id=f"status-{status}",
+            )
+            for status in (408, 429, 502, 503, 504)
+        ],
+        *[
+            pytest.param(
+                _status_error(status), ProviderError,
+                f"Groq request failed with status {status}", id=f"status-{status}",
+            )
+            for status in (400, 401, 403, 404, 422, 500)
+        ],
     ],
 )
-def test_sdk_errors_become_provider_errors(
-    fake_groq: type[FakeGroq], error: Exception, expected: str
+def test_sdk_errors_are_classified(
+    fake_groq: type[FakeGroq], error: Exception, expected_type: type, expected_message: str
 ) -> None:
     fake_groq.result = error
 
     with pytest.raises(ProviderError) as exc_info:
-        GroqProvider(api_key=FAKE_KEY, model="m").generate(_request())
+        _provider().generate(_request())
 
-    assert exc_info.value.message == expected
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.message == expected_message
     assert FAKE_KEY not in exc_info.value.message

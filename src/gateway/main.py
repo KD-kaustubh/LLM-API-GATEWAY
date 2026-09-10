@@ -8,6 +8,7 @@ from gateway.auth.bootstrap import build_api_key_service
 from gateway.config import get_settings
 from gateway.errors import GatewayError, error_response
 from gateway.middleware import BodySizeLimitMiddleware
+from gateway.rate_limit import InMemoryRateLimiter
 
 MAX_VALIDATION_DETAILS = 10
 MAX_LOC_PART_LENGTH = 64
@@ -45,6 +46,9 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, version=settings.app_version)
     app.state.api_key_service = build_api_key_service(settings)
+    app.state.rate_limiter = InMemoryRateLimiter(
+        settings.rate_limit_requests, settings.rate_limit_window_seconds
+    )
     app.include_router(api_router)
     app.add_middleware(BodySizeLimitMiddleware)
     app.add_exception_handler(GatewayError, handle_gateway_error)

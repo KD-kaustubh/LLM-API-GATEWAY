@@ -8,20 +8,26 @@ from gateway.api.schemas import (
     ErrorResponse,
     HealthResponse,
 )
-from gateway.api.security import authenticate_request
+from gateway.api.security import enforce_rate_limit
 from gateway.config import Settings, get_settings
 from gateway.providers.factory import get_provider
 from gateway.services.inference import InferenceService
+from gateway.services.retry import Retrier, RetryPolicy
 
 router = APIRouter()
-# Every /v1 route requires a valid API key; /health stays public on the root router.
-v1_router = APIRouter(prefix="/v1", dependencies=[Depends(authenticate_request)])
+# Every /v1 route is authenticated, then rate limited per client; /health stays public.
+v1_router = APIRouter(prefix="/v1", dependencies=[Depends(enforce_rate_limit)])
 
 
 def get_inference_service(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> InferenceService:
-    return InferenceService(lambda model: get_provider(model, settings))
+    policy = RetryPolicy(
+        max_retries=settings.max_retries,
+        base_delay=settings.retry_base_delay,
+        max_delay=settings.retry_max_delay,
+    )
+    return InferenceService(lambda model: get_provider(model, settings), Retrier(policy))
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -37,6 +43,7 @@ def health(settings: Annotated[Settings, Depends(get_settings)]) -> HealthRespon
         401: {"model": ErrorResponse},
         413: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
         502: {"model": ErrorResponse},
         503: {"model": ErrorResponse},
     },

@@ -1,9 +1,14 @@
 from typing import Any
 
-from groq import Groq, GroqError, APIStatusError
+from groq import APIConnectionError, APIStatusError, APITimeoutError, Groq, GroqError
 
-from gateway.errors import ProviderError
-from gateway.providers.base import ProviderRequest, ProviderResponse, TokenUsage
+from gateway.errors import ProviderError, ProviderTimeoutError, TransientProviderError
+from gateway.providers.base import (
+    ProviderRequest,
+    ProviderResponse,
+    TokenUsage,
+    error_for_status,
+)
 
 
 def build_request_kwargs(model: str, request: ProviderRequest) -> dict[str, Any]:
@@ -38,18 +43,26 @@ def parse_completion(completion: Any, fallback_model: str) -> ProviderResponse:
 class GroqProvider:
     name = "groq"
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, timeout_seconds: float) -> None:
         self._api_key = api_key
         self._model = model
+        self._timeout_seconds = timeout_seconds
 
     def generate(self, request: ProviderRequest) -> ProviderResponse:
         try:
-            with Groq(api_key=self._api_key) as client:
+            # max_retries=0: the gateway's Retrier is the only retry layer, keeping attempts bounded.
+            with Groq(
+                api_key=self._api_key, timeout=self._timeout_seconds, max_retries=0
+            ) as client:
                 completion = client.chat.completions.create(
                     **build_request_kwargs(self._model, request)
                 )
+        except APITimeoutError as exc:
+            raise ProviderTimeoutError("Groq request timed out") from exc
+        except APIConnectionError as exc:
+            raise TransientProviderError("Groq connection failed") from exc
         except APIStatusError as exc:
-            raise ProviderError(f"Groq request failed with status {exc.status_code}") from exc
+            raise error_for_status("Groq", exc.status_code) from exc
         except GroqError as exc:
             raise ProviderError("Groq request failed") from exc
         return parse_completion(completion, self._model)
