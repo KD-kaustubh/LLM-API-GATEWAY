@@ -24,6 +24,9 @@ dev = [
     "httpx>=0.27",
 ]
 
+[project.scripts]
+gateway-create-key = "gateway.auth.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

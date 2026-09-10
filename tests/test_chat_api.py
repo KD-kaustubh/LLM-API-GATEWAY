@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gateway.api.routes import get_inference_service
+from gateway.api.schemas import MAX_CONTENT_CHARS, MAX_MESSAGES, MAX_MODEL_LENGTH, MAX_OUTPUT_TOKENS
 from gateway.errors import ProviderError
 from gateway.main import app
 from gateway.providers.base import ProviderRequest, ProviderResponse
@@ -80,6 +81,16 @@ def test_all_roles_accepted(client: TestClient) -> None:
         pytest.param({"max_tokens": -5}, id="max-tokens-negative"),
         pytest.param({"max_tokens": "10"}, id="max-tokens-string"),
         pytest.param({"stream": True}, id="unknown-field"),
+        pytest.param({"model": "m" * (MAX_MODEL_LENGTH + 1)}, id="model-too-long"),
+        pytest.param(
+            {"messages": [{"role": "user", "content": "hi"}] * (MAX_MESSAGES + 1)},
+            id="too-many-messages",
+        ),
+        pytest.param(
+            {"messages": [{"role": "user", "content": "x" * (MAX_CONTENT_CHARS + 1)}]},
+            id="content-too-long",
+        ),
+        pytest.param({"max_tokens": MAX_OUTPUT_TOKENS + 1}, id="max-tokens-too-large"),
     ],
 )
 def test_invalid_requests_rejected(client: TestClient, overrides: dict[str, Any]) -> None:
@@ -89,6 +100,16 @@ def test_invalid_requests_rejected(client: TestClient, overrides: dict[str, Any]
     error = response.json()["error"]
     assert error["type"] == "invalid_request"
     assert error["details"]
+
+
+def test_values_at_limits_accepted(client: TestClient) -> None:
+    payload = _payload(
+        messages=[{"role": "user", "content": "hi"}] * (MAX_MESSAGES - 1)
+        + [{"role": "user", "content": "x" * MAX_CONTENT_CHARS}],
+        temperature=2.0,
+        max_tokens=MAX_OUTPUT_TOKENS,
+    )
+    assert client.post(URL, json=payload).status_code == 200
 
 
 def test_missing_model_rejected(client: TestClient) -> None:
@@ -140,13 +161,11 @@ def test_provider_failure_returns_502(client: TestClient) -> None:
     }
 
 
-def test_unexpected_error_hides_internals() -> None:
+def test_unexpected_error_hides_internals(client: TestClient) -> None:
     _use_provider(_FailingProvider(RuntimeError("secret-internal-detail at C:\\path\\file.py")))
-    client = TestClient(app, raise_server_exceptions=False)
-    try:
-        response = client.post(URL, json=_payload())
-    finally:
-        app.dependency_overrides.clear()
+    lenient_client = TestClient(app, raise_server_exceptions=False, headers=client.headers)
+
+    response = lenient_client.post(URL, json=_payload())
 
     assert response.status_code == 500
     assert response.json() == {

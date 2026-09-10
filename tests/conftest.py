@@ -1,9 +1,15 @@
+import secrets
 import socket
 from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from gateway.api.security import get_api_key_service
+from gateway.auth.hashing import ApiKeyHasher
+from gateway.auth.models import IssuedApiKey
+from gateway.auth.service import ApiKeyService
+from gateway.auth.store import InMemoryApiKeyStore
 from gateway.config import Settings, get_settings
 from gateway.main import app
 
@@ -25,13 +31,46 @@ def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(_env_file=None, groq_api_key=None, google_api_key=None)
+    return Settings(
+        _env_file=None,
+        groq_api_key=None,
+        google_api_key=None,
+        api_key_pepper=None,
+        api_key_hashes=None,
+    )
 
 
 @pytest.fixture
-def client(settings: Settings) -> Iterator[TestClient]:
+def key_store() -> InMemoryApiKeyStore:
+    return InMemoryApiKeyStore()
+
+
+@pytest.fixture
+def api_key_service(key_store: InMemoryApiKeyStore) -> ApiKeyService:
+    return ApiKeyService(key_store, ApiKeyHasher(secrets.token_bytes(32)))
+
+
+@pytest.fixture
+def issued_key(api_key_service: ApiKeyService) -> IssuedApiKey:
+    return api_key_service.create_key("test-client")
+
+
+@pytest.fixture
+def auth_headers(issued_key: IssuedApiKey) -> dict[str, str]:
+    return {"Authorization": f"Bearer {issued_key.api_key}"}
+
+
+@pytest.fixture
+def anon_client(settings: Settings, api_key_service: ApiKeyService) -> Iterator[TestClient]:
     app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_api_key_service] = lambda: api_key_service
     try:
         yield TestClient(app)
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(anon_client: TestClient, auth_headers: dict[str, str]) -> TestClient:
+    """Authenticated client; shares anon_client's dependency overrides."""
+    return TestClient(app, headers=auth_headers)

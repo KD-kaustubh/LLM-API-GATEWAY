@@ -3,7 +3,14 @@ from fastapi.testclient import TestClient
 
 from gateway.config import Settings
 
-PROVIDER_ENV_VARS = ("GROQ_API_KEY", "GROQ_MODEL_NAME", "GOOGLE_API_KEY", "GEMINI_MODEL_NAME")
+PROVIDER_ENV_VARS = (
+    "GROQ_API_KEY",
+    "GROQ_MODEL_NAME",
+    "GOOGLE_API_KEY",
+    "GEMINI_MODEL_NAME",
+    "API_KEY_PEPPER",
+    "API_KEY_HASHES",
+)
 
 
 @pytest.fixture
@@ -48,6 +55,22 @@ def test_empty_key_is_treated_as_missing(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_api_keys_are_masked_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
     assert "test-groq-key" not in repr(Settings(_env_file=None))
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_auth_settings_default_to_unset() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.api_key_pepper is None
+    assert settings.api_key_hashes is None
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_auth_secrets_are_masked_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_KEY_PEPPER", "pepper-value-for-test-only")
+    monkeypatch.setenv("API_KEY_HASHES", "dev:hash-entry-for-test-only")
+    text = repr(Settings(_env_file=None))
+    assert "pepper-value-for-test-only" not in text
+    assert "hash-entry-for-test-only" not in text
 
 
 def test_app_starts_without_provider_keys(client: TestClient) -> None:

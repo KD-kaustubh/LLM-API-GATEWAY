@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     google_api_key: SecretStr | None = None
     gemini_model_name: str = "gemini-2.5-flash"
 
+    api_key_pepper: SecretStr | None = None
+    api_key_hashes: SecretStr | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

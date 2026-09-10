@@ -11,16 +11,18 @@ capabilities are introduced incrementally, phase by phase.
 
 ## Current Status
 
-Phase 1 — Core Inference API + Provider Abstraction
+Phase 2 — Authentication + Validation
 
 Implemented:
 
-- `POST /v1/chat/completions` with strict request validation
+- `POST /v1/chat/completions` with strict, bounded request validation
 - A provider abstraction with Mock, Groq, and Gemini implementations
 - A normalized response format, independent of the provider
-- Consistent, machine-readable error responses
+- API-key authentication for all `/v1` endpoints (`/health` stays public)
+- Hashed credential storage (in-memory for now), key generation, and revocation
+- Request body size limit and consistent, machine-readable error responses
 
-Authentication, retries/fallback, rate limiting, caching, persistence, and observability are
+Rate limiting, quotas, retries/fallback, caching, persistence, and observability are
 **not** implemented yet.
 
 ## Architecture
@@ -28,7 +30,10 @@ Authentication, retries/fallback, rate limiting, caching, persistence, and obser
 ```
 Client
  ↓
-FastAPI  (routes + Pydantic validation)
+FastAPI
+ ├── Body size limit (middleware)
+ ├── API-key authentication (dependency)  → 401
+ └── Pydantic request validation          → 422
  ↓
 Inference Service
  ↓
@@ -40,18 +45,109 @@ Provider Factory
 
 - **API layer** (`gateway/api`) validates requests and delegates to the inference service.
   It contains no provider-specific logic.
+- **Authentication** (`gateway/auth`) generates, hashes, stores, and verifies API keys. It
+  knows nothing about providers or inference; `gateway/api/security.py` adapts it to FastAPI.
 - **Inference service** (`gateway/services/inference.py`) resolves a provider, converts the
   API request into an internal `ProviderRequest`, calls the provider, and builds the
-  `ChatCompletionResponse` (including a `req_<uuid>` request ID).
+  `ChatCompletionResponse` (including a `req_<uuid>` request ID). It does not know how API
+  keys are stored.
 - **Providers** (`gateway/providers`) implement the `LLMProvider` protocol:
   `generate(ProviderRequest) -> ProviderResponse`. Each SDK is imported only in its own
   module (`groq.py`, `gemini.py`).
 - **Provider factory** (`gateway/providers/factory.py`) maps the requested `model` to a
   provider instance, using configuration for credentials and model names.
 
+## Authentication
+
+Every request to a `/v1` endpoint must include a gateway API key as a Bearer token:
+
+```
+Authorization: Bearer gw_live_...
+```
+
+Keys look like `gw_live_<key id>_<secret>`: a 16-character hex key ID (not secret, used to
+look up the credential) followed by a 43-character URL-safe secret (256 bits of randomness).
+
+| Endpoint                     | Access    |
+|------------------------------|-----------|
+| `GET /health`                | Public    |
+| `POST /v1/chat/completions`  | Protected |
+
+Any authentication failure — missing header, wrong scheme, malformed key, unknown key, or
+revoked key — returns the same response, so callers cannot tell which check failed:
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+
+{"error": {"type": "authentication_error", "message": "Invalid API key"}}
+```
+
+### Creating a key for local development
+
+There is no database or key-management endpoint yet, so local keys are bootstrapped through
+environment variables that hold only **hashes**, never raw keys.
+
+1. Set a pepper in your local `.env` (at least 32 characters, random):
+
+   ```
+   python -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+
+   ```
+   API_KEY_PEPPER=<paste the value>
+   ```
+
+2. Create a key:
+
+   ```
+   gateway-create-key --client-id my-dev-client
+   ```
+
+   (or `python -m gateway.auth.cli --client-id my-dev-client`)
+
+   The raw key is printed **once**; save it somewhere safe. The command also prints a
+   `client_id:key_id:key_hash` entry.
+
+3. Add the entry to your local `.env` (comma-separate multiple entries):
+
+   ```
+   API_KEY_HASHES=my-dev-client:<key id>:<key hash>
+   ```
+
+4. Restart the server and send the raw key as `Authorization: Bearer <key>`.
+
+Changing `API_KEY_PEPPER` invalidates every existing key hash.
+
+### Security design
+
+- **Raw keys are never stored.** A key is hashed immediately after generation; the store
+  holds only the key ID, the hash, the client ID, a creation timestamp, and an optional
+  revocation timestamp. The raw key is returned exactly once, at creation.
+- **Cryptographically secure randomness.** Keys are generated with Python's `secrets` module.
+- **Keyed hashing.** Hashes are HMAC-SHA256 with a server-side pepper (`API_KEY_PEPPER`).
+  Because keys have 256 bits of entropy, brute force is infeasible, and without the pepper a
+  leaked hash cannot even be checked offline. (Slow password hashes such as bcrypt exist for
+  low-entropy human passwords and would only add latency here.)
+- **Timing-safe verification.** Hashes are compared with `hmac.compare_digest`, and an
+  unknown key ID still performs a comparison against a dummy hash, so the lookup path does not
+  reveal whether a key ID exists.
+- **Generic errors.** Clients always get the same `401` body and never learn why a key failed.
+- **No secrets in logs or errors.** Failed authentications are logged with the non-secret key
+  ID and a reason only. Validation errors return field locations, messages, and error types —
+  never submitted values, headers, or credentials — and are capped at 10 entries.
+- **Development defaults are safe.** With no pepper configured, the app starts with an empty
+  credential store and a random per-process pepper. `APP_ENV=production` refuses to start
+  without a pepper.
+- **The credential store is in-memory and is NOT production persistence.** Keys created at
+  runtime disappear on restart. Persistent storage is planned for Phase 4; the `ApiKeyStore`
+  protocol lets a database-backed store replace `InMemoryApiKeyStore` without changing routes.
+
 ## API
 
 ### `POST /v1/chat/completions`
+
+Requires `Authorization: Bearer <api key>`.
 
 Request:
 
@@ -67,16 +163,17 @@ Request:
 }
 ```
 
-| Field         | Type   | Rules                                                      |
-|---------------|--------|------------------------------------------------------------|
-| `model`       | string | Required. One of `mock`, `groq`, `gemini`                  |
-| `messages`    | array  | Required, at least one message                             |
-| `role`        | string | `system`, `user`, or `assistant`                           |
-| `content`     | string | Required, must contain non-whitespace text                 |
-| `temperature` | number | Optional, `0.0`–`2.0`                                      |
-| `max_tokens`  | int    | Optional, greater than `0`                                 |
+| Field         | Type   | Rules                                                          |
+|---------------|--------|----------------------------------------------------------------|
+| `model`       | string | Required, 1–100 chars. One of `mock`, `groq`, `gemini`         |
+| `messages`    | array  | Required, 1–100 messages                                       |
+| `role`        | string | `system`, `user`, or `assistant`                               |
+| `content`     | string | Required, 1–100,000 chars, must contain non-whitespace text    |
+| `temperature` | number | Optional, `0.0`–`2.0`                                          |
+| `max_tokens`  | int    | Optional, `1`–`32768`                                          |
 
-Unknown fields are rejected. Streaming is not supported yet.
+Unknown fields are rejected, and request bodies larger than 1 MiB are rejected with `413`.
+Streaming is not supported yet.
 
 Response:
 
@@ -127,7 +224,10 @@ All errors share one shape:
 | Status | `type`                    | When                                                   |
 |--------|---------------------------|--------------------------------------------------------|
 | 400    | `unsupported_model`       | `model` is not a known provider                        |
-| 422    | `invalid_request`         | Validation failed (includes a `details` list)          |
+| 401    | `authentication_error`    | Missing, malformed, unknown, or revoked API key        |
+| 404    | `not_found`               | Unknown route                                          |
+| 413    | `request_too_large`       | Request body exceeds 1 MiB                             |
+| 422    | `invalid_request`         | Validation failed (includes a bounded `details` list)  |
 | 502    | `provider_error`          | The upstream provider call failed or returned no text  |
 | 503    | `provider_not_configured` | The selected provider's API key is not set             |
 | 500    | `internal_error`          | Unexpected error (no internal details are exposed)     |
@@ -141,6 +241,8 @@ All errors share one shape:
 - Groq Python SDK (`groq`)
 - Google Gen AI SDK (`google-genai`)
 - Pytest
+
+Authentication uses only the Python standard library (`secrets`, `hmac`, `hashlib`).
 
 ## Local Setup
 
@@ -168,43 +270,49 @@ Run the application:
 uvicorn gateway.main:app --reload
 ```
 
-Health endpoint:
+Health endpoint (public):
 
 ```
 http://127.0.0.1:8000/health
 ```
 
-Try a mock completion (no API keys needed):
+Try a mock completion (after creating a key as described in
+[Creating a key for local development](#creating-a-key-for-local-development)):
 
 ```
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model": "mock", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-Interactive API docs are available at `http://127.0.0.1:8000/docs`.
+Interactive API docs are available at `http://127.0.0.1:8000/docs` (use **Authorize** to set
+the Bearer key).
 
 ## Configuration
 
 Settings are read from environment variables, and optionally from a local `.env` file
 (which is git-ignored). Copy `.env.example` to `.env` and fill in only what you need.
 
-| Variable            | Default                   | Purpose                                 |
-|---------------------|---------------------------|-----------------------------------------|
-| `APP_NAME`          | `LLM API Gateway`         | Application title                       |
-| `APP_VERSION`       | `0.1.0`                   | Version reported by `/health`           |
-| `APP_ENV`           | `development`             | Environment name                        |
-| `LOG_LEVEL`         | `INFO`                    | Log level                               |
-| `GROQ_API_KEY`      | *(unset)*                 | Groq API key                            |
-| `GROQ_MODEL_NAME`   | `llama-3.3-70b-versatile` | Groq model used for `model: "groq"`     |
-| `GOOGLE_API_KEY`    | *(unset)*                 | Google AI Studio (Gemini) API key       |
-| `GEMINI_MODEL_NAME` | `gemini-2.5-flash`        | Gemini model used for `model: "gemini"` |
+| Variable            | Default                   | Purpose                                         |
+|---------------------|---------------------------|-------------------------------------------------|
+| `APP_NAME`          | `LLM API Gateway`         | Application title                               |
+| `APP_VERSION`       | `0.1.0`                   | Version reported by `/health`                   |
+| `APP_ENV`           | `development`             | Environment name (`production` requires pepper) |
+| `LOG_LEVEL`         | `INFO`                    | Log level                                       |
+| `GROQ_API_KEY`      | *(unset)*                 | Groq API key                                    |
+| `GROQ_MODEL_NAME`   | `llama-3.3-70b-versatile` | Groq model used for `model: "groq"`             |
+| `GOOGLE_API_KEY`    | *(unset)*                 | Google AI Studio (Gemini) API key               |
+| `GEMINI_MODEL_NAME` | `gemini-2.5-flash`        | Gemini model used for `model: "gemini"`         |
+| `API_KEY_PEPPER`    | *(unset)*                 | Secret HMAC key for hashing gateway API keys    |
+| `API_KEY_HASHES`    | *(unset)*                 | `client_id:key_id:key_hash` entries, comma-separated |
 
-Provider keys are optional. The application starts, `/health` works, and the mock provider
-works without any keys. Requesting `groq` or `gemini` without its key returns a `503`
-`provider_not_configured` error. Empty values are treated as unset.
+Provider keys are optional. The application starts and `/health` works without any keys.
+Requesting `groq` or `gemini` without its key returns a `503` `provider_not_configured`
+error. Empty values are treated as unset.
 
-Never commit a real `.env` file or paste keys into source code or documentation.
+Never commit a real `.env` file or paste keys, peppers, or hashes into source code or
+documentation.
 
 ## Testing
 
@@ -212,21 +320,30 @@ Never commit a real `.env` file or paste keys into source code or documentation.
 python -m pytest -v
 ```
 
-The automated tests **never call external providers**. The Groq and Gemini SDK clients are
-replaced with in-process fakes that return real SDK response objects, and an autouse
-fixture blocks any non-loopback network connection, so a test that accidentally reached the
-network would fail.
+The automated tests **never call external providers** and need no configuration:
+
+- Every test that needs a gateway key generates one at runtime with a random pepper; no real
+  or real-looking credentials are stored in the test source.
+- Security tests cover key format and uniqueness, the `secrets` entropy source, hashing and
+  timing-safe verification, the store lifecycle (create/validate/revoke), every `401` path,
+  that raw keys never appear in responses, error messages, stored records, or logs, bounded
+  and non-echoing validation errors, and the body size limit.
+- The Groq and Gemini SDK clients are replaced with in-process fakes that return real SDK
+  response objects, and an autouse fixture blocks any non-loopback network connection, so a
+  test that accidentally reached the network would fail.
 
 ### Manual smoke test against a real provider
 
 Only run this when you have valid credentials locally. It makes a real, billable request.
 
-1. Add the relevant key to your local `.env` (`GROQ_API_KEY` and/or `GOOGLE_API_KEY`).
+1. Add the relevant provider key to your local `.env` (`GROQ_API_KEY` and/or `GOOGLE_API_KEY`)
+   and create a gateway key as described above.
 2. Start the server: `uvicorn gateway.main:app`
 3. Send a request with `model` set to `groq` or `gemini`:
 
    ```
    curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+     -H "Authorization: Bearer $GATEWAY_API_KEY" \
      -H "Content-Type: application/json" \
      -d '{"model": "groq", "messages": [{"role": "user", "content": "Say hello in one sentence."}]}'
    ```
@@ -234,8 +351,9 @@ Only run this when you have valid credentials locally. It makes a real, billable
    PowerShell:
 
    ```
+   $headers = @{ Authorization = "Bearer $env:GATEWAY_API_KEY" }
    $body = '{"model": "gemini", "messages": [{"role": "user", "content": "Say hello in one sentence."}]}'
-   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/v1/chat/completions -ContentType "application/json" -Body $body
+   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/v1/chat/completions -Headers $headers -ContentType "application/json" -Body $body
    ```
 
 4. Expect `200` with `provider` set to the provider you chose and non-null `usage` counts.
@@ -247,11 +365,21 @@ LLM-API-GATEWAY/
 ├── src/
 │   └── gateway/
 │       ├── config.py              # Settings (env / .env)
-│       ├── errors.py              # Client-safe error types
+│       ├── errors.py              # Client-safe error types and error envelope
 │       ├── main.py                # App creation and error handlers
+│       ├── middleware.py          # Request body size limit
 │       ├── api/
-│       │   ├── routes.py          # /health and /v1/chat/completions
-│       │   └── schemas.py         # Request/response models
+│       │   ├── routes.py          # /health (public) and /v1/chat/completions (protected)
+│       │   ├── schemas.py         # Request/response models and validation limits
+│       │   └── security.py        # FastAPI Bearer authentication dependency
+│       ├── auth/
+│       │   ├── keys.py            # API key generation and parsing
+│       │   ├── hashing.py         # HMAC-SHA256 hashing and timing-safe verification
+│       │   ├── models.py          # ApiKeyRecord, IssuedApiKey, AuthenticatedClient
+│       │   ├── store.py           # ApiKeyStore protocol and in-memory store
+│       │   ├── service.py         # Create, revoke, and authenticate keys
+│       │   ├── bootstrap.py       # Build the credential store from settings
+│       │   └── cli.py             # gateway-create-key development helper
 │       ├── services/
 │       │   └── inference.py       # Provider-independent inference flow
 │       └── providers/
@@ -272,12 +400,14 @@ LLM-API-GATEWAY/
 
 - [x] Phase 0 — Repository and API foundation
 - [x] Phase 1 — Core inference API + provider abstraction
-- [ ] Phase 2 — *(provider abstraction merged into Phase 1)*
-- [ ] Phase 3 — Authentication and validation
-- [ ] Phase 4 — Reliability and provider fallback
-- [ ] Phase 5 — Rate limiting and quotas
-- [ ] Phase 6 — Caching and usage tracking
-- [ ] Phase 7 — Observability
-- [ ] Phase 8 — Persistence
-- [ ] Phase 9 — Docker, testing and security
-- [ ] Phase 10 — Deployment and documentation
+- [x] Phase 2 — Authentication + validation
+
+Planned (not implemented):
+
+- [ ] Persistence (Phase 4), including a database-backed credential store
+- [ ] Reliability and provider fallback
+- [ ] Rate limiting and quotas
+- [ ] Caching and usage tracking
+- [ ] Observability
+- [ ] Docker, testing and security hardening
+- [ ] Deployment and documentation

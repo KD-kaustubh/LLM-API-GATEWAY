@@ -2,7 +2,14 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-NonBlankStr = Annotated[str, Field(min_length=1, pattern=r"\S")]
+MAX_MODEL_LENGTH = 100
+MAX_MESSAGES = 100
+MAX_CONTENT_CHARS = 100_000
+MAX_OUTPUT_TOKENS = 32_768
+
+# pattern=r"\S" requires at least one non-whitespace character.
+ModelName = Annotated[str, Field(min_length=1, max_length=MAX_MODEL_LENGTH, pattern=r"\S")]
+MessageContent = Annotated[str, Field(min_length=1, max_length=MAX_CONTENT_CHARS, pattern=r"\S")]
 
 
 class HealthResponse(BaseModel):
@@ -17,16 +24,16 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     role: Literal["system", "user", "assistant"]
-    content: NonBlankStr
+    content: MessageContent
 
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    model: NonBlankStr
-    messages: list[ChatMessage] = Field(min_length=1)
+    model: ModelName
+    messages: list[ChatMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
-    max_tokens: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, gt=0, le=MAX_OUTPUT_TOKENS)
 
 
 class Usage(BaseModel):
