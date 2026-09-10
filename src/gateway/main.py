@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gateway.api.routes import router as api_router
-from gateway.auth.bootstrap import build_api_key_service
+from gateway.auth.bootstrap import build_api_key_service, seed_api_keys
 from gateway.config import get_settings
 from gateway.errors import GatewayError, error_response
 from gateway.middleware import (
@@ -71,7 +71,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(settings.log_level)
     # Fail closed: if the database cannot be initialized, the server does not start.
     database = initialize_database(settings.database_url)
-    app.state.api_key_service = build_api_key_service(settings, SQLiteApiKeyStore(database))
+    key_store = SQLiteApiKeyStore(database)
+    app.state.api_key_service = build_api_key_service(settings, key_store)
+    seed_api_keys(settings, key_store)
     app.state.usage_recorder = SQLiteUsageRepository(database)
     app.state.cache_store = SQLiteCacheStore(database, max_entries=settings.cache_max_entries)
     app.state.api_keys_verifiable = settings.api_key_pepper is not None

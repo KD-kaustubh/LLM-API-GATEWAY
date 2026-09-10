@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     gemini_model_name: str = "gemini-2.5-flash"
 
     api_key_pepper: SecretStr | None = None
+    # Comma-separated client_id:key_id:key_hash entries inserted at startup if missing
+    # (from `gateway-create-key --seed`). For hosts without a shell or persistent disk.
+    api_key_seeds: SecretStr | None = None
 
     database_url: str = "sqlite:///./data/gateway.db"
 
@@ -44,6 +47,8 @@ class Settings(BaseSettings):
     cors_origins: str = ""
     # Bearer token for GET /metrics. Unset: /metrics is open in development, 404 elsewhere.
     metrics_token: SecretStr | None = None
+    # Set by Render to the service's exact onrender.com hostname; trusted automatically.
+    render_external_hostname: str | None = None
 
     @property
     def is_development(self) -> bool:
@@ -51,7 +56,10 @@ class Settings(BaseSettings):
 
     @property
     def trusted_host_list(self) -> list[str]:
-        return _split_csv(self.trusted_hosts)
+        hosts = _split_csv(self.trusted_hosts)
+        if self.render_external_hostname and self.render_external_hostname not in hosts:
+            hosts.append(self.render_external_hostname)
+        return hosts
 
     @property
     def cors_origin_list(self) -> list[str]:

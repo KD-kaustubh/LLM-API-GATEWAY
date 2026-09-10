@@ -39,7 +39,9 @@ coverage.xml
 *.log
 tmp/
 
-# Container definitions
+# Container and deployment definitions, helper scripts
 Dockerfile
 compose.yaml
 .dockerignore
+render.yaml
+scripts/

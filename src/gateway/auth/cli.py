@@ -1,7 +1,7 @@
 """Development key management: create or revoke gateway API keys in the configured database.
 
 Usage:
-  gateway-create-key --client-id <client-id>
+  gateway-create-key --client-id <client-id> [--seed]
   gateway-revoke-key --key-id <key-id>
 """
 
@@ -10,8 +10,9 @@ import re
 import sys
 from datetime import datetime, timezone
 
-from gateway.auth.bootstrap import hasher_from_settings
+from gateway.auth.bootstrap import format_seed_entry, hasher_from_settings
 from gateway.auth.service import ApiKeyService, validate_client_id
+from gateway.auth.store import ApiKeyStore, InMemoryApiKeyStore
 from gateway.config import Settings, get_settings
 from gateway.persistence.database import DatabaseInitializationError
 from gateway.persistence.migrations import initialize_database
@@ -31,6 +32,11 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
         prog="gateway-create-key", description="Create a gateway API key and store its hash."
     )
     parser.add_argument("--client-id", required=True, type=_client_id)
+    parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="Do not touch the database; print an API_KEY_SEEDS entry for a deployment instead.",
+    )
     args = parser.parse_args(argv)
     settings = settings or get_settings()
 
@@ -38,12 +44,16 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
     if hasher is None:
         print(_PEPPER_HINT, file=sys.stderr)
         return 1
-    store = _open_store(settings)
+    store: ApiKeyStore | None = InMemoryApiKeyStore() if args.seed else _open_store(settings)
     if store is None:
         return 1
 
     issued = ApiKeyService(store, hasher).create_key(args.client_id)
     print(f"Created API key for client '{args.client_id}' (key id {issued.record.key_id}).")
+    if args.seed:
+        print("Nothing was stored. Add this hash-only entry to API_KEY_SEEDS on the deployment")
+        print("(comma-separate multiple entries); it only works with this same API_KEY_PEPPER:\n")
+        print(f"  {format_seed_entry(issued.record)}\n")
     print("The key is shown once and cannot be recovered; only its hash is stored:\n")
     print(f"  {issued.api_key}")
     return 0
