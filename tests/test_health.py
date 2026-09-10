@@ -1,18 +1,11 @@
 from fastapi.testclient import TestClient
 
-from gateway.main import app
 
-client = TestClient(app)
-
-
-def test_health_returns_200() -> None:
+def test_health_returns_200(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
 
 
-def test_health_response_body() -> None:
-    response = client.get("/health")
-    body = response.json()
-    assert body["status"] == "ok"
-    assert body["service"] == "llm-api-gateway"
-    assert body["version"] == "0.1.0"
+def test_health_response_body(client: TestClient) -> None:
+    body = client.get("/health").json()
+    assert body == {"status": "ok", "service": "llm-api-gateway", "version": "0.1.0"}
