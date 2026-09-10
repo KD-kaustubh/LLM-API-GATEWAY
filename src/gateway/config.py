@@ -1,7 +1,9 @@
 from functools import lru_cache
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from gateway.persistence.database import sqlite_path_from_url
 
 
 class Settings(BaseSettings):
@@ -21,7 +23,12 @@ class Settings(BaseSettings):
     gemini_model_name: str = "gemini-2.5-flash"
 
     api_key_pepper: SecretStr | None = None
-    api_key_hashes: SecretStr | None = None
+
+    database_url: str = "sqlite:///./data/gateway.db"
+
+    cache_enabled: bool = False
+    cache_ttl_seconds: float = Field(default=300.0, gt=0, le=7 * 86_400)
+    cache_max_entries: int = Field(default=1000, ge=1, le=100_000)
 
     provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     max_retries: int = Field(default=2, ge=0, le=5)
@@ -30,6 +37,12 @@ class Settings(BaseSettings):
 
     rate_limit_requests: int = Field(default=60, ge=1, le=100_000)
     rate_limit_window_seconds: float = Field(default=60.0, gt=0, le=86_400)
+
+    @field_validator("database_url")
+    @classmethod
+    def _check_database_url(cls, value: str) -> str:
+        sqlite_path_from_url(value)
+        return value
 
     @model_validator(mode="after")
     def _check_retry_delays(self) -> "Settings":

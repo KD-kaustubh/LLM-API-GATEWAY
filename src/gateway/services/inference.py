@@ -1,11 +1,27 @@
+import logging
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Literal
 from uuid import uuid4
 
 from gateway.api.schemas import ChatCompletionRequest, ChatCompletionResponse, Usage
 from gateway.providers.base import LLMProvider, Message, ProviderRequest, ProviderResponse
+from gateway.services.cache import ResponseCache, build_cache_key, is_cacheable
 from gateway.services.retry import Retrier, RetryPolicy
+from gateway.services.usage import CACHE_PROVIDER, UsageRecord, UsageRecorder
+
+logger = logging.getLogger(__name__)
 
 ProviderResolver = Callable[[str], LLMProvider]
+CacheStatus = Literal["HIT", "MISS", "BYPASS"]
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    response: ChatCompletionResponse
+    cache_status: CacheStatus
 
 
 def to_provider_request(request: ChatCompletionRequest) -> ProviderRequest:
@@ -31,13 +47,82 @@ def to_api_response(result: ProviderResponse) -> ChatCompletionResponse:
 
 
 class InferenceService:
-    def __init__(self, resolve_provider: ProviderResolver, retrier: Retrier | None = None) -> None:
+    def __init__(
+        self,
+        resolve_provider: ProviderResolver,
+        retrier: Retrier | None = None,
+        cache: ResponseCache | None = None,
+        usage: UsageRecorder | None = None,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
         self._resolve_provider = resolve_provider
         self._retrier = retrier or Retrier(RetryPolicy(max_retries=0))
+        self._cache = cache
+        self._usage = usage
+        self._clock = clock
 
-    def create_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+    def create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        client_id: str = "anonymous",
+        key_id: str | None = None,
+    ) -> CompletionResult:
+        started = self._clock()
         # Provider resolution (unknown model, missing credentials) happens once, outside retries.
         provider = self._resolve_provider(request.model)
+
+        cache_key = None
+        if self._cache is not None and is_cacheable(request):
+            cache_key = build_cache_key(request, provider.name, provider.model)
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                response = ChatCompletionResponse(
+                    id=f"req_{uuid4().hex}",
+                    model=cached.model,
+                    provider=cached.provider,
+                    content=cached.content,
+                    # No provider call was made, so this request consumed no provider tokens.
+                    usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
+                )
+                self._record_usage(response, CACHE_PROVIDER, client_id, key_id, started, cache_hit=True)
+                return CompletionResult(response, "HIT")
+
         provider_request = to_provider_request(request)
         result = self._retrier.call(lambda: provider.generate(provider_request), provider.name)
-        return to_api_response(result)
+        response = to_api_response(result)
+
+        if cache_key is not None and self._cache is not None:
+            self._cache.put(cache_key, result)
+        self._record_usage(response, result.provider, client_id, key_id, started, cache_hit=False)
+        return CompletionResult(response, "MISS" if cache_key else "BYPASS")
+
+    def _record_usage(
+        self,
+        response: ChatCompletionResponse,
+        provider: str,
+        client_id: str,
+        key_id: str | None,
+        started: float,
+        cache_hit: bool,
+    ) -> None:
+        if self._usage is None:
+            return
+        record = UsageRecord(
+            request_id=response.id,
+            client_id=client_id,
+            key_id=key_id,
+            model=response.model,
+            provider=provider,
+            created_at=datetime.now(timezone.utc),
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            total_tokens=response.usage.total_tokens,
+            latency_ms=round((self._clock() - started) * 1000),
+            cache_hit=cache_hit,
+        )
+        try:
+            self._usage.record(record)
+        except Exception as exc:  # fail open: a successful completion is still returned
+            logger.warning(
+                "Usage recording failed for request %s: %s", response.id, type(exc).__name__
+            )

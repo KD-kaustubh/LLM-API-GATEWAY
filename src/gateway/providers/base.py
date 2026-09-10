@@ -48,6 +48,12 @@ class ProviderResponse:
 
 
 class LLMProvider(Protocol):
-    name: str
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def model(self) -> str:
+        """The upstream model this provider instance calls."""
+        ...
 
     def generate(self, request: ProviderRequest) -> ProviderResponse: ...

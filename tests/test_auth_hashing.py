@@ -6,6 +6,7 @@ import pytest
 from gateway.auth import hashing
 from gateway.auth.hashing import ApiKeyHasher
 from gateway.auth.keys import generate_api_key
+from tests.conftest import secret_of
 
 
 @pytest.fixture
@@ -32,7 +33,7 @@ def test_hash_is_deterministic_hex_sha256(hasher: ApiKeyHasher) -> None:
 
 def test_hash_does_not_contain_key(hasher: ApiKeyHasher) -> None:
     api_key = generate_api_key()
-    secret_part = api_key.rsplit("_", 1)[-1]
+    secret_part = secret_of(api_key)
     assert secret_part not in hasher.hash(api_key)
 
 

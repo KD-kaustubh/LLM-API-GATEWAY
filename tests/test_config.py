@@ -10,7 +10,10 @@ PROVIDER_ENV_VARS = (
     "GOOGLE_API_KEY",
     "GEMINI_MODEL_NAME",
     "API_KEY_PEPPER",
-    "API_KEY_HASHES",
+    "DATABASE_URL",
+    "CACHE_ENABLED",
+    "CACHE_TTL_SECONDS",
+    "CACHE_MAX_ENTRIES",
     "PROVIDER_TIMEOUT_SECONDS",
     "MAX_RETRIES",
     "RETRY_BASE_DELAY",
@@ -128,16 +131,59 @@ def test_api_keys_are_masked_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_auth_settings_default_to_unset() -> None:
     settings = Settings(_env_file=None)
     assert settings.api_key_pepper is None
-    assert settings.api_key_hashes is None
 
 
 @pytest.mark.usefixtures("clean_env")
 def test_auth_secrets_are_masked_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("API_KEY_PEPPER", "pepper-value-for-test-only")
-    monkeypatch.setenv("API_KEY_HASHES", "dev:hash-entry-for-test-only")
-    text = repr(Settings(_env_file=None))
-    assert "pepper-value-for-test-only" not in text
-    assert "hash-entry-for-test-only" not in text
+    assert "pepper-value-for-test-only" not in repr(Settings(_env_file=None))
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_persistence_and_cache_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.database_url == "sqlite:///./data/gateway.db"
+    assert settings.cache_enabled is False
+    assert settings.cache_ttl_seconds == 300
+    assert settings.cache_max_entries == 1000
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_persistence_and_cache_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///./other/place.db")
+    monkeypatch.setenv("CACHE_ENABLED", "true")
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("CACHE_MAX_ENTRIES", "50")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_url == "sqlite:///./other/place.db"
+    assert settings.cache_enabled is True
+    assert settings.cache_ttl_seconds == 60
+    assert settings.cache_max_entries == 50
+
+
+@pytest.mark.usefixtures("clean_env")
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("DATABASE_URL", "postgresql://user@host/db"),
+        ("DATABASE_URL", "sqlite:///"),
+        ("DATABASE_URL", "sqlite:///:memory:"),
+        ("DATABASE_URL", "./data/gateway.db"),
+        ("CACHE_ENABLED", "maybe"),
+        ("CACHE_TTL_SECONDS", "0"),
+        ("CACHE_TTL_SECONDS", "-5"),
+        ("CACHE_MAX_ENTRIES", "0"),
+        ("CACHE_MAX_ENTRIES", "1000001"),
+    ],
+)
+def test_invalid_persistence_settings_fail_clearly(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError, match=name.lower()):
+        Settings(_env_file=None)
 
 
 def test_app_starts_without_provider_keys(client: TestClient) -> None:

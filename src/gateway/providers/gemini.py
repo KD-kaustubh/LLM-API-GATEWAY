@@ -66,6 +66,10 @@ class GeminiProvider:
         self._model = model
         self._timeout_seconds = timeout_seconds
 
+    @property
+    def model(self) -> str:
+        return self._model
+
     def generate(self, request: ProviderRequest) -> ProviderResponse:
         try:
             with Client(

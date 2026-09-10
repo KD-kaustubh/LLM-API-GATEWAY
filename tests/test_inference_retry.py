@@ -17,6 +17,7 @@ from gateway.main import app
 from gateway.providers.base import ProviderRequest, ProviderResponse, TokenUsage
 from gateway.services.inference import InferenceService
 from gateway.services.retry import Retrier, RetryPolicy
+from gateway.services.usage import InMemoryUsageRecorder
 
 URL = "/v1/chat/completions"
 PAYLOAD: dict[str, Any] = {"model": "mock", "messages": [{"role": "user", "content": "Hi"}]}
@@ -60,7 +61,7 @@ def use_provider(anon_client: TestClient) -> Iterator[Any]:
 def test_service_retries_transient_failures_then_returns_normalized_response() -> None:
     provider = CountingProvider(TransientProviderError("a"), ProviderTimeoutError("b"))
 
-    response = _service(provider).create_chat_completion(ChatCompletionRequest.model_validate(PAYLOAD))
+    response = _service(provider).create_chat_completion(ChatCompletionRequest.model_validate(PAYLOAD)).response
 
     assert provider.calls == 3
     assert response.content == "done"
@@ -91,7 +92,7 @@ def test_default_service_does_not_retry() -> None:
 
 def test_inference_service_dependency_uses_configured_policy(settings: Settings) -> None:
     configured = settings.model_copy(update={"max_retries": 4, "retry_base_delay": 0.1, "retry_max_delay": 1.5})
-    service = get_inference_service(configured)
+    service = get_inference_service(configured, cache=None, usage=InMemoryUsageRecorder())
     assert service._retrier._policy == RetryPolicy(max_retries=4, base_delay=0.1, max_delay=1.5)
 
 

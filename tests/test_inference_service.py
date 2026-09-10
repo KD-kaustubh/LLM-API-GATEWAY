@@ -61,7 +61,10 @@ def test_invokes_provider_with_translated_request() -> None:
 
 
 def test_builds_normalized_response() -> None:
-    response = InferenceService(lambda _: RecordingProvider()).create_chat_completion(_request())
+    result = InferenceService(lambda _: RecordingProvider()).create_chat_completion(_request())
+    response = result.response
+
+    assert result.cache_status == "BYPASS"
 
     assert response.id.startswith("req_")
     assert response.object == "chat.completion"

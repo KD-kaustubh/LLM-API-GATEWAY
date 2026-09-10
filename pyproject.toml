@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 gateway-create-key = "gateway.auth.cli:main"
+gateway-revoke-key = "gateway.auth.cli:revoke_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

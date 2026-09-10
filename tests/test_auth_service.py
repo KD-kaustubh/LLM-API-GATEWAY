@@ -10,6 +10,7 @@ from gateway.auth.models import AuthenticatedClient, IssuedApiKey
 from gateway.auth.service import ApiKeyService
 from gateway.auth.store import InMemoryApiKeyStore
 from gateway.errors import AuthenticationError
+from tests.conftest import secret_of
 
 
 def test_create_key_returns_raw_key_and_record(issued_key: IssuedApiKey) -> None:
@@ -23,7 +24,7 @@ def test_raw_key_is_never_stored(key_store: InMemoryApiKeyStore, issued_key: Iss
     stored = key_store.get(issued_key.record.key_id)
     assert stored is not None
 
-    secret_part = issued_key.api_key.rsplit("_", 1)[-1]
+    secret_part = secret_of(issued_key.api_key)
     for value in astuple(stored):
         assert issued_key.api_key not in str(value)
         assert secret_part not in str(value)
@@ -62,8 +63,9 @@ def test_unknown_well_formed_key_rejected(api_key_service: ApiKeyService) -> Non
 def test_known_key_id_with_wrong_secret_rejected(
     api_key_service: ApiKeyService, issued_key: IssuedApiKey
 ) -> None:
-    prefix, _, secret = issued_key.api_key.rpartition("_")
-    tampered = f"{prefix}_{'A' if secret[0] != 'A' else 'B'}{secret[1:]}"
+    secret = secret_of(issued_key.api_key)
+    head = issued_key.api_key[: -len(secret)]
+    tampered = f"{head}{'A' if secret[0] != 'A' else 'B'}{secret[1:]}"
 
     with pytest.raises(AuthenticationError):
         api_key_service.authenticate(tampered)
@@ -138,4 +140,4 @@ def test_raw_keys_never_logged(
     auth_logs = [r for r in caplog.records if r.name.startswith("gateway.auth")]
     assert len(auth_logs) == 3
     for raw in (issued_key.api_key, unknown, other.api_key):
-        assert raw.rsplit("_", 1)[-1] not in caplog.text
+        assert secret_of(raw) not in caplog.text

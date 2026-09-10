@@ -1,21 +1,45 @@
+import os
 import secrets
+import shutil
 import socket
+import tempfile
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from gateway.api.security import get_api_key_service, get_rate_limiter
-from gateway.auth.hashing import ApiKeyHasher
-from gateway.auth.models import IssuedApiKey
-from gateway.auth.service import ApiKeyService
-from gateway.auth.store import InMemoryApiKeyStore
-from gateway.config import Settings, get_settings
-from gateway.main import app
-from gateway.rate_limit import InMemoryRateLimiter
+# Safety net: anything that builds the real app during tests uses a throwaway database,
+# never the development database. Set before any gateway module reads settings.
+_SESSION_DB_DIR = Path(tempfile.mkdtemp(prefix="gateway-tests-"))
+os.environ["DATABASE_URL"] = f"sqlite:///{(_SESSION_DB_DIR / 'session.db').as_posix()}"
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from gateway.api.routes import get_cache_store, get_usage_recorder  # noqa: E402
+from gateway.api.security import get_api_key_service, get_rate_limiter  # noqa: E402
+from gateway.auth.hashing import ApiKeyHasher  # noqa: E402
+from gateway.auth.models import IssuedApiKey  # noqa: E402
+from gateway.auth.service import ApiKeyService  # noqa: E402
+from gateway.auth.store import InMemoryApiKeyStore  # noqa: E402
+from gateway.config import Settings, get_settings  # noqa: E402
+from gateway.main import app  # noqa: E402
+from gateway.persistence.database import Database  # noqa: E402
+from gateway.persistence.migrations import initialize_database  # noqa: E402
+from gateway.rate_limit import InMemoryRateLimiter  # noqa: E402
+from gateway.services.cache import InMemoryCacheStore  # noqa: E402
+from gateway.services.usage import InMemoryUsageRecorder  # noqa: E402
+
+def secret_of(api_key: str) -> str:
+    """The 43-char secret of gw_live_<16 hex>_<secret>. Fixed offset: the secret may contain '_'."""
+    return api_key[len("gw_live_") + 17:]
+
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 _real_connect = socket.socket.connect
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    shutil.rmtree(_SESSION_DB_DIR, ignore_errors=True)
 
 
 def _guarded_connect(self: socket.socket, address: object) -> None:
@@ -37,8 +61,14 @@ def settings() -> Settings:
         groq_api_key=None,
         google_api_key=None,
         api_key_pepper=None,
-        api_key_hashes=None,
+        cache_enabled=False,
     )
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Database:
+    """A fresh, migrated SQLite database per test."""
+    return initialize_database(f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
 
 
 @pytest.fixture
@@ -62,7 +92,7 @@ def auth_headers(issued_key: IssuedApiKey) -> dict[str, str]:
 
 
 class FakeClock:
-    """Manually advanced monotonic clock for deterministic time-based tests."""
+    """Manually advanced clock for deterministic time-based tests."""
 
     def __init__(self, start: float = 1000.0) -> None:
         self.now = start
@@ -85,12 +115,28 @@ def rate_limiter(clock: FakeClock) -> InMemoryRateLimiter:
 
 
 @pytest.fixture
+def usage_recorder() -> InMemoryUsageRecorder:
+    return InMemoryUsageRecorder()
+
+
+@pytest.fixture
+def cache_store() -> InMemoryCacheStore:
+    return InMemoryCacheStore(max_entries=100)
+
+
+@pytest.fixture
 def anon_client(
-    settings: Settings, api_key_service: ApiKeyService, rate_limiter: InMemoryRateLimiter
+    settings: Settings,
+    api_key_service: ApiKeyService,
+    rate_limiter: InMemoryRateLimiter,
+    usage_recorder: InMemoryUsageRecorder,
+    cache_store: InMemoryCacheStore,
 ) -> Iterator[TestClient]:
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_api_key_service] = lambda: api_key_service
     app.dependency_overrides[get_rate_limiter] = lambda: rate_limiter
+    app.dependency_overrides[get_usage_recorder] = lambda: usage_recorder
+    app.dependency_overrides[get_cache_store] = lambda: cache_store
     try:
         yield TestClient(app)
     finally:

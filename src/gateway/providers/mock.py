@@ -9,6 +9,7 @@ class MockProvider:
     """Deterministic offline provider; token counts are whitespace word counts, not real tokens."""
 
     name = "mock"
+    model = "mock"
 
     def generate(self, request: ProviderRequest) -> ProviderResponse:
         last_user = next(
@@ -19,7 +20,7 @@ class MockProvider:
         output_tokens = _count_words(content)
         return ProviderResponse(
             provider=self.name,
-            model="mock",
+            model=self.model,
             content=content,
             usage=TokenUsage(
                 input_tokens=input_tokens,

@@ -1,3 +1,6 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -8,6 +11,12 @@ from gateway.auth.bootstrap import build_api_key_service
 from gateway.config import get_settings
 from gateway.errors import GatewayError, error_response
 from gateway.middleware import BodySizeLimitMiddleware
+from gateway.persistence.migrations import initialize_database
+from gateway.persistence.repositories import (
+    SQLiteApiKeyStore,
+    SQLiteCacheStore,
+    SQLiteUsageRepository,
+)
 from gateway.rate_limit import InMemoryRateLimiter
 
 MAX_VALIDATION_DETAILS = 10
@@ -42,10 +51,20 @@ async def handle_unexpected_error(request: Request, exc: Exception) -> JSONRespo
     return error_response(500, "internal_error", "An unexpected error occurred")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Fail closed: if the database cannot be initialized, the server does not start.
+    settings = get_settings()
+    database = initialize_database(settings.database_url)
+    app.state.api_key_service = build_api_key_service(settings, SQLiteApiKeyStore(database))
+    app.state.usage_recorder = SQLiteUsageRepository(database)
+    app.state.cache_store = SQLiteCacheStore(database, max_entries=settings.cache_max_entries)
+    yield
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title=settings.app_name, version=settings.app_version)
-    app.state.api_key_service = build_api_key_service(settings)
+    app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
     app.state.rate_limiter = InMemoryRateLimiter(
         settings.rate_limit_requests, settings.rate_limit_window_seconds
     )

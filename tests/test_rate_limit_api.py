@@ -9,7 +9,7 @@ from gateway.auth.models import IssuedApiKey
 from gateway.auth.service import ApiKeyService
 from gateway.main import app
 from gateway.rate_limit import InMemoryRateLimiter
-from tests.conftest import FakeClock
+from tests.conftest import secret_of, FakeClock
 
 URL = "/v1/chat/completions"
 PAYLOAD: dict[str, Any] = {"model": "mock", "messages": [{"role": "user", "content": "Hi"}]}
@@ -132,7 +132,7 @@ def test_state_is_keyed_by_client_id_not_raw_key(
     client.post(URL, json=PAYLOAD)
 
     assert set(limiter._buckets) == {"test-client"}
-    secret_part = issued_key.api_key.rsplit("_", 1)[-1]
+    secret_part = secret_of(issued_key.api_key)
     assert secret_part not in repr(limiter._buckets)
 
 
@@ -147,7 +147,7 @@ def test_raw_key_never_in_rate_limit_logs_or_response(
 
     assert response.status_code == 429
     assert "Rate limit exceeded for client test-client" in caplog.text
-    secret_part = issued_key.api_key.rsplit("_", 1)[-1]
+    secret_part = secret_of(issued_key.api_key)
     assert secret_part not in caplog.text
     assert issued_key.api_key not in response.text
     assert issued_key.api_key not in str(response.headers)

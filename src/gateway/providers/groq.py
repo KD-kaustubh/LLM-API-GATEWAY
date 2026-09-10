@@ -48,6 +48,10 @@ class GroqProvider:
         self._model = model
         self._timeout_seconds = timeout_seconds
 
+    @property
+    def model(self) -> str:
+        return self._model
+
     def generate(self, request: ProviderRequest) -> ProviderResponse:
         try:
             # max_retries=0: the gateway's Retrier is the only retry layer, keeping attempts bounded.

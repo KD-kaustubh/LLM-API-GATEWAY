@@ -11,7 +11,7 @@ capabilities are introduced incrementally, phase by phase.
 
 ## Current Status
 
-Phase 3 — Reliability + Rate Limiting
+Phase 4 — Caching + Usage + Persistence
 
 Implemented:
 
@@ -19,12 +19,15 @@ Implemented:
 - A provider abstraction with Mock, Groq, and Gemini implementations
 - A normalized response format, independent of the provider
 - API-key authentication for all `/v1` endpoints (`/health` stays public)
-- Hashed credential storage (in-memory for now), key generation, and revocation
+- Hashed API-key storage in SQLite, with CLI key creation and revocation
 - Request body size limit and consistent, machine-readable error responses
 - Provider timeouts and bounded retries with backoff for transient provider failures
 - Per-client rate limiting (`429` with `Retry-After`)
+- Per-request usage records (tokens, latency, cache hit) in SQLite
+- Opt-in response cache for deterministic requests, with TTL and a size cap
 
-Provider fallback, quotas, caching, persistence, and observability are **not** implemented yet.
+Provider fallback, quotas, metrics, and distributed (multi-instance) state are **not**
+implemented yet.
 
 ## Architecture
 
@@ -39,12 +42,20 @@ FastAPI
  ↓
 Inference Service
  ├── Provider Factory (once per request)   → 400 / 503
- └── Retrier (transient errors only)       → 502 when exhausted
-      ↓
-     Provider (with per-attempt timeout)
-      ├── Mock
-      ├── Groq
-      └── Gemini
+ ├── Cache lookup (temperature 0 only)     → HIT: return cached answer, skip provider
+ ├── Retrier (transient errors only)       → 502 when exhausted
+ │    ↓
+ │   Provider (with per-attempt timeout)
+ │    ├── Mock
+ │    ├── Groq
+ │    └── Gemini
+ ├── Cache store (successful answers only)
+ └── Usage record (every completed request)
+
+SQLite (gateway/persistence)
+ ├── api_keys        key metadata and hashes
+ ├── usage_records   one row per completed request
+ └── cache_entries   cached responses with expiry
 ```
 
 - **API layer** (`gateway/api`) validates requests and delegates to the inference service.
@@ -57,6 +68,11 @@ Inference Service
   `req_<uuid>` request ID). It does not know how API keys are stored.
 - **Rate limiter** (`gateway/rate_limit.py`) implements the `RateLimiter` protocol; the
   `enforce_rate_limit` dependency applies it to every `/v1` route after authentication.
+- **Cache and usage** (`gateway/services/cache.py`, `gateway/services/usage.py`) define the
+  `CacheStore` and `UsageRecorder` protocols used by the inference service.
+- **Persistence** (`gateway/persistence`) holds all SQL: connection handling, schema
+  migrations, and SQLite implementations of `ApiKeyStore`, `UsageRecorder`, and `CacheStore`.
+  The API layer and services never touch SQLite directly.
 - **Providers** (`gateway/providers`) implement the `LLMProvider` protocol:
   `generate(ProviderRequest) -> ProviderResponse`. Each SDK is imported only in its own
   module (`groq.py`, `gemini.py`).
@@ -89,10 +105,10 @@ WWW-Authenticate: Bearer
 {"error": {"type": "authentication_error", "message": "Invalid API key"}}
 ```
 
-### Creating a key for local development
+### Managing keys
 
-There is no database or key-management endpoint yet, so local keys are bootstrapped through
-environment variables that hold only **hashes**, never raw keys.
+Keys are managed from the command line only; there are no key-management HTTP endpoints.
+Both commands use the database configured by `DATABASE_URL`.
 
 1. Set a pepper in your local `.env` (at least 32 characters, random):
 
@@ -110,20 +126,21 @@ environment variables that hold only **hashes**, never raw keys.
    gateway-create-key --client-id my-dev-client
    ```
 
-   (or `python -m gateway.auth.cli --client-id my-dev-client`)
+   The key is hashed and its metadata (key ID, hash, client ID, timestamp) is written to the
+   database. The raw key is printed **once** and is never stored; save it somewhere safe. A
+   client can have several keys.
 
-   The raw key is printed **once**; save it somewhere safe. The command also prints a
-   `client_id:key_id:key_hash` entry.
+3. Use it as `Authorization: Bearer <key>`. Keys persist across server restarts; the running
+   server reads them from the database on each request, so no restart is needed.
 
-3. Add the entry to your local `.env` (comma-separate multiple entries):
+4. Revoke a key by its key ID (printed at creation, and the 16 hex characters after
+   `gw_live_`). Revocation takes effect immediately and persists:
 
    ```
-   API_KEY_HASHES=my-dev-client:<key id>:<key hash>
+   gateway-revoke-key --key-id <key id>
    ```
 
-4. Restart the server and send the raw key as `Authorization: Bearer <key>`.
-
-Changing `API_KEY_PEPPER` invalidates every existing key hash.
+Changing `API_KEY_PEPPER` invalidates every stored key hash.
 
 ### Security design
 
@@ -142,12 +159,14 @@ Changing `API_KEY_PEPPER` invalidates every existing key hash.
 - **No secrets in logs or errors.** Failed authentications are logged with the non-secret key
   ID and a reason only. Validation errors return field locations, messages, and error types —
   never submitted values, headers, or credentials — and are capped at 10 entries.
-- **Development defaults are safe.** With no pepper configured, the app starts with an empty
-  credential store and a random per-process pepper. `APP_ENV=production` refuses to start
-  without a pepper.
-- **The credential store is in-memory and is NOT production persistence.** Keys created at
-  runtime disappear on restart. Persistent storage is planned for Phase 4; the `ApiKeyStore`
-  protocol lets a database-backed store replace `InMemoryApiKeyStore` without changing routes.
+- **Development defaults are safe.** With no pepper configured, the app starts with a random
+  per-process pepper (and logs a warning), so no stored key can be verified.
+  `APP_ENV=production` refuses to start without a pepper.
+- **Persistent, replaceable store.** Key metadata lives in SQLite (`api_keys`). The pepper
+  stays in the environment and is never written to the database. Routes depend only on the
+  `ApiKeyStore` protocol, so a PostgreSQL store can replace `SQLiteApiKeyStore` later.
+- **Fails closed.** If the credential store cannot be read during a request, the request is
+  rejected with a generic `500`; it is never let through.
 
 ## Reliability
 
@@ -216,6 +235,100 @@ authentication never touch any client's limit.
   without changing routes. Memory stays bounded: only authenticated clients get a bucket,
   and buckets idle for a full window are pruned.
 
+## Persistence
+
+State that must survive restarts is stored in SQLite through the standard-library `sqlite3`
+module (no ORM, no extra dependency).
+
+- **Location:** `DATABASE_URL`, default `sqlite:///./data/gateway.db` — relative to the
+  directory the server is started from. Use `sqlite:////absolute/path/gateway.db` for an
+  absolute path. The parent directory is created on startup. `data/` and all `*.db*` files are
+  git-ignored.
+- **Initialization:** runs at application startup (not at import). A `schema_migrations`
+  table records applied versions; missing migrations are applied in one transaction, existing
+  tables and rows are never dropped, and repeated starts are no-ops. A database with a newer
+  schema than the code supports is refused.
+- **Connections:** one short-lived connection per operation (no connection shared across
+  threads), WAL journal mode, a 5-second busy timeout, a transaction per operation, and
+  parameterized SQL only.
+
+| Table            | Contents                                                                        |
+|------------------|---------------------------------------------------------------------------------|
+| `api_keys`       | `key_id` (PK), `key_hash`, `client_id` (indexed), `created_at`, `revoked_at`    |
+| `usage_records`  | `request_id` (unique), `client_id`, `key_id`, `model`, `provider`, `created_at`, token counts, `latency_ms`, `cache_hit` — indexed on `(client_id, created_at)` and `created_at` |
+| `cache_entries`  | `cache_key` (PK, SHA-256), `response_payload` (JSON), `model`, `created_at`, `expires_at` (indexed), `size_bytes` |
+
+### Failure behaviour
+
+| Failure                         | Behaviour                                                        |
+|---------------------------------|------------------------------------------------------------------|
+| Database cannot be initialized  | **Fail closed:** the server does not start                       |
+| Credential lookup fails         | **Fail closed:** request rejected with a generic `500`           |
+| Cache read fails                | **Fail open:** logged, treated as a miss, provider is called     |
+| Cache write fails               | **Fail open:** logged, the successful response is returned       |
+| Usage write fails               | **Fail open:** logged, the successful response is returned       |
+
+Logged persistence failures include only the exception type, never SQL values, paths, or
+secrets. A usage-write failure means that request is missing from `usage_records`; this is a
+deliberate trade-off so a bookkeeping problem never turns a successful LLM answer into an error.
+
+## Usage Tracking
+
+Every **successful** completion writes one row to `usage_records`:
+
+- request ID (same as the response `id`), client ID, key ID, timestamp (UTC)
+- model and provider, token counts, total latency in milliseconds, and `cache_hit`
+- Token counts come from the provider's normalized usage; if the provider did not report a
+  value it is stored as `NULL`, never estimated. Mock provider counts are its documented word
+  counts.
+- Cache hits are recorded with `provider = "cache"`, `cache_hit = 1`, and **zero** tokens,
+  because no provider call was made.
+- Requests rejected before inference (`401`, `413`, `422`, `429`) and failed completions
+  (`400`, `502`, `503`) are not recorded as usage.
+
+The table is shaped for later metrics (request counts, cache hit rate, latency, tokens per
+client) but no metrics endpoint exists yet. Usage rows are append-only; there is no retention
+policy yet.
+
+## Response Cache
+
+The cache is **off by default** (`CACHE_ENABLED=false`). When enabled, it only ever stores
+successful responses to requests that are safe to replay:
+
+- **Eligible:** `temperature` is explicitly `0`. Omitted temperature uses the provider's
+  default (non-zero), so those requests are never cached. Streaming does not exist, so it
+  cannot be cached.
+- **Never cached:** provider errors, timeouts, exhausted retries, empty responses, and any
+  request rejected by authentication, rate limiting, or validation. A retried request is
+  written to the cache once, after it finally succeeds.
+- **Key:** SHA-256 of a canonical JSON document (sorted keys) containing the key-format
+  version, provider, configured upstream model, requested `model`, every message (role and
+  content, in order), `temperature`, and `max_tokens`. Changing `GROQ_MODEL_NAME` therefore
+  never serves answers from the previous model. The key never includes the API key, headers,
+  client identity, or request ID.
+- **Sharing:** identical requests from **different clients share** a cache entry. This is
+  safe today because providers are stateless with respect to the caller; it must be revisited
+  if responses ever depend on per-client context.
+- **Limits:** entries expire after `CACHE_TTL_SECONDS` (default 300) and expired rows are
+  deleted on every write. The table holds at most `CACHE_MAX_ENTRIES` rows (default 1000);
+  beyond that the entries closest to expiry are evicted. Responses larger than 64 KiB are not
+  cached, so the cache stays under about 64 MB at the defaults.
+- **Hit behaviour:** the provider is not called. The response has the normal schema with a new
+  `id`, the original `model`, `provider`, and `content`, and `usage` of zero tokens. Every
+  `/v1/chat/completions` response includes `X-Cache: HIT`, `MISS` (eligible, not found), or
+  `BYPASS` (cache disabled or request not eligible).
+- **Rate limiting still applies:** the cache is checked after authentication and rate
+  limiting, so a cache hit consumes a rate-limit token like any other request.
+- **Stored payload:** model, provider, content, and the original token usage as JSON — never
+  credentials, headers, or error details. It is read back with `json.loads`, never
+  unpickled or evaluated.
+
+### Future backends
+
+SQLite suits a single instance. The `ApiKeyStore`, `UsageRecorder`, `CacheStore`, and
+`RateLimiter` protocols let PostgreSQL (keys, usage) and Redis (cache, rate limits) replace
+the current implementations for multi-instance deployments without changing routes.
+
 ## API
 
 ### `POST /v1/chat/completions`
@@ -246,7 +359,8 @@ Request:
 | `max_tokens`  | int    | Optional, `1`–`32768`                                          |
 
 Unknown fields are rejected, and request bodies larger than 1 MiB are rejected with `413`.
-Streaming is not supported yet.
+Streaming is not supported yet. Responses carry `X-Cache` (see [Response Cache](#response-cache))
+and the rate-limit headers.
 
 Response:
 
@@ -316,7 +430,9 @@ All errors share one shape:
 - Google Gen AI SDK (`google-genai`)
 - Pytest
 
-Authentication uses only the Python standard library (`secrets`, `hmac`, `hashlib`).
+- SQLite (standard-library `sqlite3`)
+
+Authentication, caching, and persistence use only the Python standard library.
 
 ## Local Setup
 
@@ -350,8 +466,9 @@ Health endpoint (public):
 http://127.0.0.1:8000/health
 ```
 
-Try a mock completion (after creating a key as described in
-[Creating a key for local development](#creating-a-key-for-local-development)):
+The first start creates `./data/gateway.db`.
+
+Try a mock completion (after creating a key as described in [Managing keys](#managing-keys)):
 
 ```
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
@@ -379,7 +496,10 @@ Settings are read from environment variables, and optionally from a local `.env`
 | `GOOGLE_API_KEY`    | *(unset)*                 | Google AI Studio (Gemini) API key               |
 | `GEMINI_MODEL_NAME` | `gemini-2.5-flash`        | Gemini model used for `model: "gemini"`         |
 | `API_KEY_PEPPER`    | *(unset)*                 | Secret HMAC key for hashing gateway API keys    |
-| `API_KEY_HASHES`    | *(unset)*                 | `client_id:key_id:key_hash` entries, comma-separated |
+| `DATABASE_URL`      | `sqlite:///./data/gateway.db` | SQLite file for keys, usage, and cache      |
+| `CACHE_ENABLED`     | `false`                   | Enable the response cache                       |
+| `CACHE_TTL_SECONDS` | `300`                     | Cache entry lifetime (`0` < value ≤ 7 days)     |
+| `CACHE_MAX_ENTRIES` | `1000`                    | Maximum cached responses (`1`–`100000`)         |
 | `PROVIDER_TIMEOUT_SECONDS` | `30`               | Per-attempt provider timeout (`0` < value ≤ `300`) |
 | `MAX_RETRIES`       | `2`                       | Retries after the first attempt (`0`–`5`)       |
 | `RETRY_BASE_DELAY`  | `0.5`                     | Backoff base in seconds (`0`–`30`)              |
@@ -416,6 +536,15 @@ The automated tests **never call external providers** and need no configuration:
   no test waits for real backoff.
 - Rate-limit tests use an injected fake clock to advance time deterministically, and include
   a 100-thread concurrency test proving the limit cannot be exceeded by racing requests.
+- Persistence tests use a fresh temporary SQLite file per test (and a session-wide temporary
+  `DATABASE_URL` as a safety net), so they never touch `./data/gateway.db`. They cover schema
+  and indexes, idempotent and concurrent initialization, corrupt databases, parameterized
+  SQL, concurrent writes, key persistence across restarts, and raw keys and peppers never
+  reaching the database file.
+- Cache and usage tests prove that cache hits skip the provider, that failures are never
+  cached, the TTL and size limits, that cache hits still consume rate-limit tokens, and that
+  cache and usage failures fail open. End-to-end tests boot the real app (startup included)
+  against a temporary database.
 - The Groq and Gemini SDK clients are replaced with in-process fakes that return real SDK
   response objects, and an autouse fixture blocks any non-loopback network connection, so a
   test that accidentally reached the network would fail.
@@ -454,7 +583,7 @@ LLM-API-GATEWAY/
 │   └── gateway/
 │       ├── config.py              # Settings (env / .env)
 │       ├── errors.py              # Client-safe error types and error envelope
-│       ├── main.py                # App creation and error handlers
+│       ├── main.py                # App creation, startup (database init), error handlers
 │       ├── middleware.py          # Request body size limit
 │       ├── rate_limit.py          # RateLimiter protocol and in-memory token bucket
 │       ├── api/
@@ -467,10 +596,16 @@ LLM-API-GATEWAY/
 │       │   ├── models.py          # ApiKeyRecord, IssuedApiKey, AuthenticatedClient
 │       │   ├── store.py           # ApiKeyStore protocol and in-memory store
 │       │   ├── service.py         # Create, revoke, and authenticate keys
-│       │   ├── bootstrap.py       # Build the credential store from settings
-│       │   └── cli.py             # gateway-create-key development helper
+│       │   ├── bootstrap.py       # Build the API key service from settings
+│       │   └── cli.py             # gateway-create-key / gateway-revoke-key
+│       ├── persistence/
+│       │   ├── database.py        # DATABASE_URL parsing and per-operation connections
+│       │   ├── migrations.py      # Versioned, idempotent schema migrations
+│       │   └── repositories.py    # SQLite key store, usage repository, cache store
 │       ├── services/
-│       │   ├── inference.py       # Provider-independent inference flow
+│       │   ├── inference.py       # Inference flow: cache, provider, retries, usage
+│       │   ├── cache.py           # Cache key, eligibility, fail-open ResponseCache
+│       │   ├── usage.py           # UsageRecord and UsageRecorder protocol
 │       │   └── retry.py           # RetryPolicy (backoff) and Retrier
 │       └── providers/
 │           ├── base.py            # LLMProvider protocol and internal types
@@ -492,6 +627,6 @@ LLM-API-GATEWAY/
 - [x] Phase 1 — Core API + Provider Abstraction
 - [x] Phase 2 — Authentication + Validation
 - [x] Phase 3 — Reliability + Rate Limiting
-- [ ] Phase 4 — Caching + Usage + Persistence
+- [x] Phase 4 — Caching + Usage + Persistence
 - [ ] Phase 5 — Observability + Docker + Security
 - [ ] Phase 6 — Deployment + Documentation
