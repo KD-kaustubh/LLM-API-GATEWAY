@@ -7,8 +7,11 @@ from gateway.api.schemas import (
     ChatCompletionResponse,
     ErrorResponse,
     HealthResponse,
+    ReadinessResponse,
 )
-from gateway.api.security import enforce_rate_limit
+from gateway.api.security import authorize_metrics, enforce_rate_limit
+from gateway.observability import metrics
+from gateway.persistence.migrations import database_is_ready
 from gateway.auth.models import AuthenticatedClient
 from gateway.config import Settings, get_settings
 from gateway.providers.factory import get_provider
@@ -56,7 +59,31 @@ def get_inference_service(
 
 @router.get("/health", response_model=HealthResponse)
 def health(settings: Annotated[Settings, Depends(get_settings)]) -> HealthResponse:
+    """Liveness: the process is serving HTTP. No I/O, no dependencies, no provider calls."""
     return HealthResponse(status="ok", service="llm-api-gateway", version=settings.app_version)
+
+
+@router.get("/ready", response_model=ReadinessResponse, responses={503: {"model": ReadinessResponse}})
+def ready(request: Request, response: Response) -> ReadinessResponse:
+    """Readiness: startup finished, the database is migrated and reachable, and API keys can be
+    verified. Providers are not checked: an upstream outage must not take the gateway out."""
+    state = request.app.state
+    database = getattr(state, "database", None)
+    checks: dict[str, str] = {
+        "startup": "ok" if database is not None else "fail",
+        "database": "ok" if database is not None and database_is_ready(database) else "fail",
+        "authentication": "ok" if getattr(state, "api_keys_verifiable", False) else "fail",
+    }
+    is_ready = all(result == "ok" for result in checks.values())
+    if not is_ready:
+        response.status_code = 503
+    return ReadinessResponse(status="ready" if is_ready else "not_ready", checks=checks)
+
+
+@router.get("/metrics", include_in_schema=False, dependencies=[Depends(authorize_metrics)])
+def metrics_endpoint() -> Response:
+    body, content_type = metrics.render()
+    return Response(content=body, media_type=content_type)
 
 
 @v1_router.post(
@@ -74,12 +101,18 @@ def health(settings: Annotated[Settings, Depends(get_settings)]) -> HealthRespon
 )
 def chat_completions(
     request: ChatCompletionRequest,
+    http_request: Request,
     client: Annotated[AuthenticatedClient, Depends(enforce_rate_limit)],
     service: Annotated[InferenceService, Depends(get_inference_service)],
     response: Response,
 ) -> ChatCompletionResponse:
-    result = service.create_chat_completion(request, client.client_id, client.key_id)
+    request_id = getattr(http_request.state, "request_id", None)
+    result = service.create_chat_completion(request, client.client_id, client.key_id, request_id)
     response.headers["X-Cache"] = result.cache_status
+    # Bounded, non-secret fields for the access log line.
+    http_request.state.provider = result.response.provider
+    http_request.state.model = result.response.model
+    http_request.state.cache_status = result.cache_status
     return result.response
 
 

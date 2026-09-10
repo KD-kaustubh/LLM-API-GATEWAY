@@ -113,6 +113,21 @@ def migrate(database: Database) -> int:
         conn.close()
 
 
+def database_is_ready(database: Database, timeout: float = 1.0) -> bool:
+    """Cheap readiness probe: the file opens read-write and the schema is fully migrated."""
+    try:
+        # mode=rw never creates a missing file, unlike a plain connect().
+        uri = f"{database.path.resolve().as_uri()}?mode=rw"
+        conn = sqlite3.connect(uri, uri=True, timeout=timeout)
+        try:
+            row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return False
+    return row is not None and row[0] == LATEST_VERSION
+
+
 def initialize_database(url: str) -> Database:
     """Open (creating if needed) and migrate the database. Raises on any failure: fail closed."""
     try:

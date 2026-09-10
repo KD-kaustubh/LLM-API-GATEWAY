@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,17 +26,28 @@ def _assert_auth_error(response: Any) -> None:
 # --- dependency --------------------------------------------------------------
 
 
+def _request_stub() -> Any:
+    return SimpleNamespace(state=SimpleNamespace())
+
+
 def test_dependency_returns_authenticated_client(
     api_key_service: ApiKeyService, issued_key: IssuedApiKey
 ) -> None:
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=issued_key.api_key)
-    client = authenticate_request(credentials, api_key_service)
+    request = _request_stub()
+
+    client = authenticate_request(request, credentials, api_key_service)
+
     assert client == AuthenticatedClient(client_id="test-client", key_id=issued_key.record.key_id)
+    # Only safe identifiers are exposed to the access log, never the raw key.
+    assert vars(request.state) == {"client_id": "test-client", "key_id": issued_key.record.key_id}
 
 
 def test_dependency_rejects_missing_credentials(api_key_service: ApiKeyService) -> None:
+    request = _request_stub()
     with pytest.raises(AuthenticationError):
-        authenticate_request(None, api_key_service)
+        authenticate_request(request, None, api_key_service)
+    assert vars(request.state) == {}
 
 
 # --- public / protected endpoints ---------------------------------------------

@@ -1,8 +1,6 @@
 """End-to-end tests against the real app: lifespan startup, SQLite stores, cache, and usage."""
 
-import secrets
 import sqlite3
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -13,74 +11,10 @@ from gateway.config import get_settings
 from gateway.main import create_app
 from gateway.persistence.database import DatabaseInitializationError
 from gateway.providers.mock import MockProvider
-from tests.conftest import secret_of
+from tests.conftest import Gateway, secret_of
 
 URL = "/v1/chat/completions"
 CACHEABLE: dict[str, Any] = {"model": "mock", "messages": [{"role": "user", "content": "Hello cache"}], "temperature": 0}
-
-
-class Gateway:
-    """Boots the real app from environment settings, like `uvicorn gateway.main:app`."""
-
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, db_path: Path, env: dict[str, str | None]) -> None:
-        self.db_path = db_path
-        self.pepper = secrets.token_urlsafe(32)
-        self._monkeypatch = monkeypatch
-        self._clients: list[TestClient] = []
-        self._env: dict[str, str | None] = {
-            "DATABASE_URL": f"sqlite:///{db_path.as_posix()}",
-            "API_KEY_PEPPER": self.pepper,
-            "CACHE_ENABLED": "true",
-            "RATE_LIMIT_REQUESTS": "1000",
-            **env,
-        }
-
-    def start(self) -> TestClient:
-        for name, value in self._env.items():
-            if value is None:
-                self._monkeypatch.delenv(name, raising=False)
-            else:
-                self._monkeypatch.setenv(name, value)
-        get_settings.cache_clear()
-        client = TestClient(create_app())
-        client.__enter__()  # runs lifespan startup; raises if startup fails
-        self._clients.append(client)
-        return client
-
-    def stop(self, client: TestClient) -> None:
-        self._clients.remove(client)
-        client.__exit__(None, None, None)
-
-    def close(self) -> None:
-        for client in self._clients:
-            client.__exit__(None, None, None)
-        get_settings.cache_clear()
-
-    def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-        with sqlite3.connect(self.db_path) as conn:
-            return conn.execute(sql, params).fetchall()
-
-    def file_bytes(self) -> bytes:
-        return b"".join(p.read_bytes() for p in self.db_path.parent.glob(self.db_path.name + "*"))
-
-
-@pytest.fixture
-def make_gateway(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Any]:
-    created: list[Gateway] = []
-
-    def factory(name: str = "it.db", **env: str | None) -> Gateway:
-        gw = Gateway(monkeypatch, tmp_path / name, env)
-        created.append(gw)
-        return gw
-
-    yield factory
-    for gw in created:
-        gw.close()
-
-
-@pytest.fixture
-def gateway(make_gateway: Any) -> Gateway:
-    return make_gateway()
 
 
 @pytest.fixture

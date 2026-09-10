@@ -1,0 +1,45 @@
+# Only pyproject.toml, README.md, LICENSE, and src/ are needed to build the image.
+
+# VCS and editor
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+
+# Local data (SQLite databases, WAL/SHM/journal files)
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Tests and artifacts
+tests/
+htmlcov/
+.coverage
+coverage.xml
+*.log
+tmp/
+
+# Container definitions
+Dockerfile
+compose.yaml
+.dockerignore

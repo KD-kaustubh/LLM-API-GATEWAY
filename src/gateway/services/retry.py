@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from gateway.errors import TransientProviderError
+from gateway.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +54,26 @@ class Retrier:
             try:
                 return operation()
             except TransientProviderError as exc:
+                error_type = type(exc).__name__
                 if attempt >= self._policy.max_attempts:
                     logger.warning(
                         "Provider %s failed after %d attempt(s): %s",
-                        provider, attempt, type(exc).__name__,
+                        provider, attempt, error_type,
+                        extra={"provider": provider, "attempt": attempt, "error_type": error_type},
                     )
                     raise
                 delay = self._policy.backoff(attempt, self._jitter())
                 logger.warning(
                     "Transient failure from provider %s (attempt %d/%d, %s); retrying in %.2fs",
-                    provider, attempt, self._policy.max_attempts, type(exc).__name__, delay,
+                    provider, attempt, self._policy.max_attempts, error_type, delay,
+                    extra={
+                        "provider": provider,
+                        "attempt": attempt,
+                        "max_attempts": self._policy.max_attempts,
+                        "error_type": error_type,
+                        "retry_in_s": round(delay, 3),
+                    },
                 )
+                metrics.PROVIDER_RETRIES.labels(provider).inc()
                 self._sleep(delay)
                 attempt += 1

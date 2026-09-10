@@ -20,6 +20,13 @@ class HealthResponse(BaseModel):
     version: str
 
 
+class ReadinessResponse(BaseModel):
+    """`checks` maps a check name to "ok" or "fail"; no internal details are included."""
+
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, Literal["ok", "fail"]]
+
+
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

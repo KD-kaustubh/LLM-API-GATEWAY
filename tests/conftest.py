@@ -1,10 +1,13 @@
+import logging
 import os
 import secrets
 import shutil
 import socket
+import sqlite3
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +15,8 @@ import pytest
 # never the development database. Set before any gateway module reads settings.
 _SESSION_DB_DIR = Path(tempfile.mkdtemp(prefix="gateway-tests-"))
 os.environ["DATABASE_URL"] = f"sqlite:///{(_SESSION_DB_DIR / 'session.db').as_posix()}"
+# Starlette's TestClient sends Host: testserver.
+os.environ["TRUSTED_HOSTS"] = "testserver"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -22,12 +27,13 @@ from gateway.auth.models import IssuedApiKey  # noqa: E402
 from gateway.auth.service import ApiKeyService  # noqa: E402
 from gateway.auth.store import InMemoryApiKeyStore  # noqa: E402
 from gateway.config import Settings, get_settings  # noqa: E402
-from gateway.main import app  # noqa: E402
+from gateway.main import app, create_app  # noqa: E402
 from gateway.persistence.database import Database  # noqa: E402
 from gateway.persistence.migrations import initialize_database  # noqa: E402
 from gateway.rate_limit import InMemoryRateLimiter  # noqa: E402
 from gateway.services.cache import InMemoryCacheStore  # noqa: E402
 from gateway.services.usage import InMemoryUsageRecorder  # noqa: E402
+
 
 def secret_of(api_key: str) -> str:
     """The 43-char secret of gw_live_<16 hex>_<secret>. Fixed offset: the secret may contain '_'."""
@@ -147,3 +153,75 @@ def anon_client(
 def client(anon_client: TestClient, auth_headers: dict[str, str]) -> TestClient:
     """Authenticated client; shares anon_client's dependency overrides."""
     return TestClient(app, headers=auth_headers)
+
+
+# --- real-app harness (lifespan startup + SQLite), shared by integration tests ---
+
+
+class Gateway:
+    """Boots the real app from environment settings, like `uvicorn gateway.main:app`."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, db_path: Path, env: dict[str, str | None]) -> None:
+        self.db_path = db_path
+        self.pepper = secrets.token_urlsafe(32)
+        self._monkeypatch = monkeypatch
+        self._clients: list[TestClient] = []
+        self._env: dict[str, str | None] = {
+            "DATABASE_URL": f"sqlite:///{db_path.as_posix()}",
+            "API_KEY_PEPPER": self.pepper,
+            "CACHE_ENABLED": "true",
+            "RATE_LIMIT_REQUESTS": "1000",
+            **env,
+        }
+
+    def start(self) -> TestClient:
+        for name, value in self._env.items():
+            if value is None:
+                self._monkeypatch.delenv(name, raising=False)
+            else:
+                self._monkeypatch.setenv(name, value)
+        get_settings.cache_clear()
+        client = TestClient(create_app())
+        client.__enter__()  # runs lifespan startup; raises if startup fails
+        self._clients.append(client)
+        return client
+
+    def stop(self, client: TestClient) -> None:
+        self._clients.remove(client)
+        client.__exit__(None, None, None)
+
+    def close(self) -> None:
+        for client in self._clients:
+            client.__exit__(None, None, None)
+        get_settings.cache_clear()
+        # Startup attached a JSON handler bound to this test's captured stdout; detach it.
+        gateway_logger = logging.getLogger("gateway")
+        for handler in [h for h in gateway_logger.handlers if h.get_name() == "gateway-json"]:
+            gateway_logger.removeHandler(handler)
+        gateway_logger.setLevel(logging.NOTSET)
+
+    def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def file_bytes(self) -> bytes:
+        return b"".join(p.read_bytes() for p in self.db_path.parent.glob(self.db_path.name + "*"))
+
+
+@pytest.fixture
+def make_gateway(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Any]:
+    created: list[Gateway] = []
+
+    def factory(name: str = "it.db", **env: str | None) -> Gateway:
+        gw = Gateway(monkeypatch, tmp_path / name, env)
+        created.append(gw)
+        return gw
+
+    yield factory
+    for gw in created:
+        gw.close()
+
+
+@pytest.fixture
+def gateway(make_gateway: Any) -> Gateway:
+    return make_gateway()

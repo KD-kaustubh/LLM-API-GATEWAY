@@ -11,7 +11,7 @@ capabilities are introduced incrementally, phase by phase.
 
 ## Current Status
 
-Phase 4 — Caching + Usage + Persistence
+Phase 5 — Observability + Docker + Security
 
 Implemented:
 
@@ -25,8 +25,10 @@ Implemented:
 - Per-client rate limiting (`429` with `Retry-After`)
 - Per-request usage records (tokens, latency, cache hit) in SQLite
 - Opt-in response cache for deterministic requests, with TTL and a size cap
+- Structured JSON logs with per-request IDs, Prometheus metrics, and `/ready`
+- Security headers, trusted-host checks, opt-in CORS, and a non-root Docker image
 
-Provider fallback, quotas, metrics, and distributed (multi-instance) state are **not**
+Provider fallback, quotas, deployment, and distributed (multi-instance) state are **not**
 implemented yet.
 
 ## Architecture
@@ -35,6 +37,9 @@ implemented yet.
 Client
  ↓
 FastAPI
+ ├── Request context (middleware)          request ID, security headers, access log, metrics
+ ├── Trusted host (middleware)             → 400
+ ├── CORS (middleware, only if configured)
  ├── Body size limit (middleware)          → 413
  ├── API-key authentication (dependency)   → 401
  ├── Rate limit per client (dependency)    → 429
@@ -73,6 +78,9 @@ SQLite (gateway/persistence)
 - **Persistence** (`gateway/persistence`) holds all SQL: connection handling, schema
   migrations, and SQLite implementations of `ApiKeyStore`, `UsageRecorder`, and `CacheStore`.
   The API layer and services never touch SQLite directly.
+- **Observability** (`gateway/observability`) holds the request-ID context, the JSON log
+  formatter, and the Prometheus metric definitions; `gateway/middleware.py` applies them to
+  every request.
 - **Providers** (`gateway/providers`) implement the `LLMProvider` protocol:
   `generate(ProviderRequest) -> ProviderResponse`. Each SDK is imported only in its own
   module (`groq.py`, `gemini.py`).
@@ -411,6 +419,7 @@ All errors share one shape:
 | Status | `type`                    | When                                                   |
 |--------|---------------------------|--------------------------------------------------------|
 | 400    | `unsupported_model`       | `model` is not a known provider                        |
+| 400    | `invalid_host`            | `Host` header not in `TRUSTED_HOSTS`                   |
 | 401    | `authentication_error`    | Missing, malformed, unknown, or revoked API key        |
 | 404    | `not_found`               | Unknown route                                          |
 | 413    | `request_too_large`       | Request body exceeds 1 MiB                             |
@@ -420,6 +429,150 @@ All errors share one shape:
 | 503    | `provider_not_configured` | The selected provider's API key is not set             |
 | 500    | `internal_error`          | Unexpected error (no internal details are exposed)     |
 
+Every response, including errors, carries an `X-Request-ID` header; quote it when reporting a
+problem so the matching log lines can be found. The error body itself is unchanged.
+
+## Observability
+
+### Request IDs
+
+Every request gets a server-generated `req_<32 hex>` ID. It is returned in the `X-Request-ID`
+header, used as the chat completion `id`, stored as the usage record's `request_id`, and added
+to every log line written while the request is handled. A client-supplied `X-Request-ID` is
+**ignored**: accepting it would let callers forge or collide IDs (usage request IDs are unique)
+and inject arbitrary text into logs.
+
+### Structured logs
+
+Gateway logs are JSON lines on stdout (level from `LOG_LEVEL`), configured at startup:
+
+```json
+{"timestamp": "2026-09-10T10:02:10.522+00:00", "level": "INFO", "logger": "gateway.access", "message": "request completed", "request_id": "req_62ee…", "method": "POST", "route": "/v1/chat/completions", "status_code": 200, "latency_ms": 12.4, "client_id": "team-a", "key_id": "1f0e…", "provider": "mock", "model": "mock", "cache_status": "HIT"}
+```
+
+- One access line per request (`gateway.access`): method, **route template** (never the raw
+  path or query), status, latency, and — when known — client ID, key ID, provider, model, and
+  cache status. Other lines cover retries, rate-limit rejections, auth failures (reason and key
+  ID), and cache/usage persistence failures.
+- The formatter emits only an allow-list of fields. API keys, key hashes, `Authorization`
+  headers, peppers, provider keys, prompts, and responses are never logged; tests send secrets
+  and prompt canaries through every path and assert they never appear.
+- Unhandled exceptions are logged as `exc_type` plus `file:line:function` frames only — never
+  the exception message, which could contain request data.
+- Uvicorn's own start/stop lines are plain text; its access log is disabled in the Docker image
+  because the gateway writes its own.
+
+### Metrics
+
+`GET /metrics` serves Prometheus text format from a dedicated registry:
+
+| Metric | Labels |
+|--------|--------|
+| `gateway_http_requests_total` | `method`, `route`, `status` |
+| `gateway_http_request_duration_seconds` (histogram) | `method`, `route` |
+| `gateway_auth_failures_total` | `reason` (`missing_credentials`, `malformed_key`, `unknown_key`, `hash_mismatch`, `revoked_key`, `metrics_token`) |
+| `gateway_rate_limit_rejections_total` | — |
+| `gateway_inference_requests_total` | `outcome` (`success` or the error type) |
+| `gateway_cache_lookups_total` | `result` (`hit`, `miss`, `bypass`) |
+| `gateway_completions_total` | `provider` (`cache` for cache hits) |
+| `gateway_tokens_total` | `provider`, `direction` (`input`, `output`; provider-reported only) |
+| `gateway_provider_calls_total` | `provider`, `outcome` (per attempt) |
+| `gateway_provider_errors_total` | `provider`, `error_type` (`timeout`, `transient_error`, `provider_error`, `internal_error`) |
+| `gateway_provider_call_duration_seconds` (histogram) | `provider` |
+| `gateway_provider_retries_total` | `provider` |
+
+Plus standard `process_*` and `python_gc_*` metrics. Labels only ever take values from fixed
+sets: unmatched paths are reported as `route="unmatched"`, unknown HTTP methods as `OTHER`, and
+there are no labels for request IDs, client or key IDs, API keys, prompts, or model names.
+
+**Access policy:** metrics reveal traffic and error patterns, so they are not public in
+production. With `METRICS_TOKEN` set, `/metrics` requires `Authorization: Bearer
+<METRICS_TOKEN>` (compared in constant time; a gateway API key does not work). Without a token,
+`/metrics` is open only when `APP_ENV=development` and returns `404` otherwise.
+
+```
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:8000/metrics
+```
+
+### Health and readiness
+
+| Endpoint  | Purpose   | Checks | Status |
+|-----------|-----------|--------|--------|
+| `GET /health` | Liveness | None — no database, no providers | Always `200` while the process serves HTTP |
+| `GET /ready`  | Readiness | Startup finished; SQLite file opens read-write and the schema is migrated (one small query, 1s timeout, never creates a file); `API_KEY_PEPPER` is set so keys can be verified | `200` when all pass, otherwise `503` |
+
+```json
+{"status": "ready", "checks": {"startup": "ok", "database": "ok", "authentication": "ok"}}
+```
+
+Both are public and contain no internal details. Neither calls an LLM provider: a provider
+outage makes completions return `502` but leaves the gateway live and ready.
+
+## Security Hardening
+
+- **Response headers** on every response: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` (API
+  responses are per-caller and must not be cached by intermediaries). HSTS is left to the TLS
+  terminator, which belongs to deployment.
+- **Trusted hosts:** requests whose `Host` is not in `TRUSTED_HOSTS` (exact names or
+  `*.example.com`) get `400 invalid_host`. Loopback names are always accepted so local and
+  container health checks work; they cannot be abused for DNS rebinding.
+- **CORS** is off unless `CORS_ORIGINS` lists explicit `http(s)` origins; `*` is rejected at
+  startup. Credentials are never allowed (API keys travel in the `Authorization` header).
+- **Production surface:** outside `APP_ENV=development`, `/docs`, `/redoc`, and
+  `/openapi.json` are disabled and `/metrics` requires a token.
+- **Errors:** unhandled exceptions become a generic `500` (with `X-Request-ID`); stack traces,
+  paths, SQL, and exception messages never reach clients. The existing body, message, model,
+  and `max_tokens` limits are unchanged.
+- **Configuration:** all secrets (`API_KEY_PEPPER`, `METRICS_TOKEN`, provider keys) come only
+  from the environment; `METRICS_TOKEN` must be at least 32 characters.
+
+## Docker
+
+The image is a two-stage build on `python:3.12-slim`: dependencies are installed into a
+virtualenv in the build stage, and the runtime stage contains only that virtualenv. It runs as
+the unprivileged `gateway` user (uid 10001), with `APP_ENV=production`, the database at
+`/app/data/gateway.db` (a volume), one Uvicorn worker, and a `HEALTHCHECK` that requests
+`/health` on loopback. No secrets, tests, `.env`, or databases are copied into the image
+(`.dockerignore`).
+
+Build and run:
+
+```
+docker build -t llm-api-gateway .
+
+docker run -d --name gateway -p 127.0.0.1:8000:8000 \
+  -v gateway-data:/app/data \
+  -e API_KEY_PEPPER="$API_KEY_PEPPER" -e METRICS_TOKEN="$METRICS_TOKEN" \
+  --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+  llm-api-gateway
+```
+
+Production mode refuses to start without `API_KEY_PEPPER`. Manage keys with the CLI inside
+the container (it uses the same volume and environment):
+
+```
+docker exec gateway gateway-create-key --client-id my-client
+docker exec gateway gateway-revoke-key --key-id <key id>
+```
+
+### Docker Compose
+
+`compose.yaml` runs the same image with a named volume (`gateway-data`), a read-only root
+filesystem, all capabilities dropped, and the port published on `127.0.0.1` only. Secrets come
+from `./.env` (or the file named by `GATEWAY_ENV_FILE`); `GATEWAY_PORT` changes the host port.
+
+```
+docker compose up -d --build --wait
+docker compose exec gateway gateway-create-key --client-id my-client
+curl http://127.0.0.1:8000/ready
+docker compose down        # keeps the database volume
+docker compose down -v     # also deletes it
+```
+
+SQLite data lives in the volume, so API keys, usage, and cache entries survive container
+restarts and `down`/`up`. Rate-limit counters are in memory and reset on restart.
+
 ## Tech Stack
 
 - Python
@@ -428,11 +581,12 @@ All errors share one shape:
 - Uvicorn
 - Groq Python SDK (`groq`)
 - Google Gen AI SDK (`google-genai`)
+- SQLite (standard-library `sqlite3`)
+- `prometheus-client` (metrics)
+- Docker
 - Pytest
 
-- SQLite (standard-library `sqlite3`)
-
-Authentication, caching, and persistence use only the Python standard library.
+Authentication, caching, persistence, and JSON logging use only the Python standard library.
 
 ## Local Setup
 
@@ -460,10 +614,12 @@ Run the application:
 uvicorn gateway.main:app --reload
 ```
 
-Health endpoint (public):
+Health, readiness, and (in development) metrics:
 
 ```
 http://127.0.0.1:8000/health
+http://127.0.0.1:8000/ready
+http://127.0.0.1:8000/metrics
 ```
 
 The first start creates `./data/gateway.db`.
@@ -477,8 +633,8 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model": "mock", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-Interactive API docs are available at `http://127.0.0.1:8000/docs` (use **Authorize** to set
-the Bearer key).
+In development, interactive API docs are available at `http://127.0.0.1:8000/docs` (use
+**Authorize** to set the Bearer key); they are disabled in production.
 
 ## Configuration
 
@@ -489,8 +645,11 @@ Settings are read from environment variables, and optionally from a local `.env`
 |---------------------|---------------------------|-------------------------------------------------|
 | `APP_NAME`          | `LLM API Gateway`         | Application title                               |
 | `APP_VERSION`       | `0.1.0`                   | Version reported by `/health`                   |
-| `APP_ENV`           | `development`             | Environment name (`production` requires pepper) |
-| `LOG_LEVEL`         | `INFO`                    | Log level                                       |
+| `APP_ENV`           | `development`             | `development` enables docs and open `/metrics`; `production` requires the pepper |
+| `LOG_LEVEL`         | `INFO`                    | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `TRUSTED_HOSTS`     | `localhost,127.0.0.1`     | Allowed `Host` headers (loopback always allowed) |
+| `CORS_ORIGINS`      | *(empty: CORS off)*       | Explicit browser origins, comma-separated        |
+| `METRICS_TOKEN`     | *(unset)*                 | Bearer token for `/metrics` (32+ characters)     |
 | `GROQ_API_KEY`      | *(unset)*                 | Groq API key                                    |
 | `GROQ_MODEL_NAME`   | `llama-3.3-70b-versatile` | Groq model used for `model: "groq"`             |
 | `GOOGLE_API_KEY`    | *(unset)*                 | Google AI Studio (Gemini) API key               |
@@ -545,6 +704,18 @@ The automated tests **never call external providers** and need no configuration:
   cached, the TTL and size limits, that cache hits still consume rate-limit tokens, and that
   cache and usage failures fail open. End-to-end tests boot the real app (startup included)
   against a temporary database.
+- Observability tests check request IDs on every response (and that client-supplied ones are
+  ignored), structured access-log fields, that logs never contain keys, hashes, `Bearer`
+  headers, or prompt text, every metric family, bounded labels, the `/metrics` access policy,
+  and that the metrics output contains no secrets or identifiers.
+- Health and hardening tests cover `/health` vs `/ready` (before startup, missing pepper, lost
+  or deleted database, provider outage), security headers, trusted hosts, CORS, production
+  docs/metrics lockdown, and generic `500` responses.
+
+The Docker image is verified manually (it is not part of `pytest`): build, non-root user,
+health check, `/ready`, `/metrics` policy, authenticated inference, cache, retries, rate
+limiting, persistence across restarts, revocation, and the absence of secrets in logs and
+metrics.
 - The Groq and Gemini SDK clients are replaced with in-process fakes that return real SDK
   response objects, and an autouse fixture blocks any non-loopback network connection, so a
   test that accidentally reached the network would fail.
@@ -584,12 +755,16 @@ LLM-API-GATEWAY/
 │       ├── config.py              # Settings (env / .env)
 │       ├── errors.py              # Client-safe error types and error envelope
 │       ├── main.py                # App creation, startup (database init), error handlers
-│       ├── middleware.py          # Request body size limit
+│       ├── middleware.py          # Request context, trusted hosts, body size limit
 │       ├── rate_limit.py          # RateLimiter protocol and in-memory token bucket
 │       ├── api/
-│       │   ├── routes.py          # /health (public) and /v1/chat/completions (protected)
+│       │   ├── routes.py          # /health, /ready, /metrics, /v1/chat/completions
 │       │   ├── schemas.py         # Request/response models and validation limits
-│       │   └── security.py        # Authentication and rate-limit dependencies
+│       │   └── security.py        # Auth, rate-limit, and metrics-token dependencies
+│       ├── observability/
+│       │   ├── context.py         # Request ID generation and context variable
+│       │   ├── log_config.py      # JSON log formatter and logging setup
+│       │   └── metrics.py         # Prometheus registry and metric definitions
 │       ├── auth/
 │       │   ├── keys.py            # API key generation and parsing
 │       │   ├── hashing.py         # HMAC-SHA256 hashing and timing-safe verification
@@ -614,6 +789,9 @@ LLM-API-GATEWAY/
 │           ├── groq.py            # Groq SDK integration
 │           └── gemini.py          # Google Gen AI SDK integration
 ├── tests/
+├── Dockerfile
+├── compose.yaml
+├── .dockerignore
 ├── .env.example
 ├── .gitignore
 ├── pyproject.toml
@@ -628,5 +806,5 @@ LLM-API-GATEWAY/
 - [x] Phase 2 — Authentication + Validation
 - [x] Phase 3 — Reliability + Rate Limiting
 - [x] Phase 4 — Caching + Usage + Persistence
-- [ ] Phase 5 — Observability + Docker + Security
+- [x] Phase 5 — Observability + Docker + Security
 - [ ] Phase 6 — Deployment + Documentation

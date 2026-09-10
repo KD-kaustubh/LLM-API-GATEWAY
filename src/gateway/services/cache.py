@@ -78,7 +78,10 @@ class ResponseCache:
                 model=str(data["model"]), provider=str(data["provider"]), content=str(data["content"])
             )
         except Exception as exc:  # a broken cache must never fail the request
-            logger.warning("Cache read failed; continuing without cache: %s", type(exc).__name__)
+            logger.warning(
+                "Cache read failed; continuing without cache: %s", type(exc).__name__,
+                extra={"error_type": type(exc).__name__},
+            )
             return None
 
     def put(self, key: str, result: ProviderResponse) -> None:
@@ -102,7 +105,10 @@ class ResponseCache:
             now = self._clock()
             self._store.put(key, payload, result.model, now, now + self._ttl)
         except Exception as exc:  # a broken cache must never fail the request
-            logger.warning("Cache write failed; response returned uncached: %s", type(exc).__name__)
+            logger.warning(
+                "Cache write failed; response returned uncached: %s", type(exc).__name__,
+                extra={"error_type": type(exc).__name__},
+            )
 
 
 @dataclass

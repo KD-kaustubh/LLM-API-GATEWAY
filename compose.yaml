@@ -1,0 +1,28 @@
+# Local, single-node runtime: the gateway plus a named volume for its SQLite database.
+# Secrets (API_KEY_PEPPER, METRICS_TOKEN, provider keys) are read from a git-ignored env file:
+# ./.env by default, or the file named by GATEWAY_ENV_FILE.
+services:
+  gateway:
+    build: .
+    image: llm-api-gateway:local
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8000}:8000"
+    env_file:
+      - path: ${GATEWAY_ENV_FILE:-.env}
+        required: false
+    environment:
+      # The container always uses the volume path, whatever DATABASE_URL the env file holds.
+      DATABASE_URL: sqlite:////app/data/gateway.db
+    volumes:
+      - gateway-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

@@ -8,6 +8,7 @@ from gateway.auth.keys import generate_api_key, parse_key_id
 from gateway.auth.models import ApiKeyRecord, AuthenticatedClient, IssuedApiKey
 from gateway.auth.store import ApiKeyStore
 from gateway.errors import AuthenticationError
+from gateway.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -50,17 +51,22 @@ class ApiKeyService:
         hash_matches = self._hasher.verify(api_key, expected_hash)
 
         if key_id is None:
-            self._reject("malformed key", key_id)
+            reject_authentication("malformed_key", key_id)
         if record is None:
-            self._reject("unknown key id", key_id)
+            reject_authentication("unknown_key", key_id)
         if not hash_matches:
-            self._reject("hash mismatch", key_id)
+            reject_authentication("hash_mismatch", key_id)
         if record.revoked:
-            self._reject("revoked key", key_id)
+            reject_authentication("revoked_key", key_id)
         return AuthenticatedClient(client_id=record.client_id, key_id=record.key_id)
 
-    @staticmethod
-    def _reject(reason: str, key_id: str | None) -> NoReturn:
-        # Only the non-secret key id is logged; the client always gets the same generic error.
-        logger.info("API key authentication failed: %s (key_id=%s)", reason, key_id or "-")
-        raise AuthenticationError()
+
+def reject_authentication(reason: str, key_id: str | None = None) -> NoReturn:
+    """Log and count a failure, then raise the generic error. `reason` is a fixed slug."""
+    # Only the non-secret key id is logged; the client always gets the same generic error.
+    logger.info(
+        "API key authentication failed: %s (key_id=%s)", reason, key_id or "-",
+        extra={"reason": reason, "key_id": key_id},
+    )
+    metrics.AUTH_FAILURES.labels(reason).inc()
+    raise AuthenticationError()

@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "groq>=1.0",
     "google-genai>=1.0",
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
